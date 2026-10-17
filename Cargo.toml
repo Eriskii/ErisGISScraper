@@ -11,8 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 erisgis = { path = "erisgis" }
-erisharness = { git = "https://github.com/Eriskii/ErisHarness" }
-erisagentauth = { git = "https://github.com/Eriskii/ErisAgentAuth", tag = "v0.2.0" }
+erisharness = { git = "https://github.com/Eriskii/ErisHarness", features = ["web"] }
+erisagentauth = { git = "https://github.com/Eriskii/ErisAgentAuth", tag = "v0.3.0", features = ["web"] }
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 regex = "1.13.1"

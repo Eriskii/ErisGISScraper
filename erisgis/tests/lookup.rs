@@ -177,3 +177,22 @@ async fn parcels_stacked_on_one_outline_are_one_feature_listing_its_units() {
     let outlines: std::collections::HashSet<String> = view.features.iter().map(|f| f["geometry"].to_string()).collect();
     assert_eq!(outlines.len(), view.features.len(), "one feature per outline");
 }
+
+#[tokio::test]
+async fn the_map_gets_repaired_outlines() {
+    use geo::Validation;
+    let counties = Counties::embedded().unwrap();
+    let [x, y] = counties.get("55025").unwrap().interior;
+    let root = support::serve(support::Grid::around(x, y)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = dir.path().join("registry");
+    adapter(&registry, "wi-dane", &format!("{root}/arcgis/bowties/FeatureServer/0"), json!({"counties": ["55025"]}));
+    write(&registry.join("index.json"), &json!({"version": 1, "counties": {"55025": ["wi-dane"]}}));
+
+    let view = read(&registry, &dir.path().join("cache"), dane_box(&counties)).await;
+    assert!(view.features.len() > 3);
+    for feature in &view.features {
+        let geometry = erisgis::geom::from_geojson(&feature["geometry"]).unwrap();
+        assert!(geometry.is_valid(), "{}", feature["properties"]["key"]);
+    }
+}

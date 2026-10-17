@@ -1,11 +1,11 @@
 //! `arcgis`: search ArcGIS Hub and ArcGIS Online for layers, and inspect ArcGIS REST services.
 
 use super::text::{short, strip_html, window};
-use crate::cli;
 use crate::journal::Job;
 use crate::work::Work;
 use clap::{CommandFactory, Parser, Subcommand};
 use erisgis::geom::Bbox;
+use erisharness::tools::cli;
 use erisharness::tools::{Tool, ToolContext, ToolOutput};
 use futures_util::future::BoxFuture;
 use serde_json::Value;

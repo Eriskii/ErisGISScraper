@@ -3,18 +3,17 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use erisagentauth::claude::{self, ClaudeAccount};
-use erisagentauth::openai::{self, Method, OpenAiAccount};
-use erisagentauth::{App, Event};
+use erisagentauth::claude;
+use erisagentauth::openai::{self, Method};
+use erisagentauth::{Accounts, App, Event};
 use erisgis::counties::{self, Counties};
 use erisgis::http::{Http, Limits};
 use erisgis::registry::{Registry, Standing, now};
 use erisgis::runtime::{Runtime, VALIDATE_WITHIN};
 use erisgis::spec::Spec;
 use erisgis::{Dataset, validate};
-use erisgisscraper::assist::Assistant;
 use erisgisscraper::journal::Journal;
-use erisgisscraper::models::{ANTHROPIC, CODEX, Endpoints};
+use erisgisscraper::models::{ANTHROPIC, CODEX, Providers};
 use erisgisscraper::scheduler::{Scheduler, Settings};
 use erisgisscraper::view::View;
 use erisgisscraper::work::Work;
@@ -119,70 +118,39 @@ enum Command {
     },
 }
 
-fn accounts_dir(state: &Path) -> Result<PathBuf> {
-    let dir = state.join("accounts");
-    std::fs::create_dir_all(&dir)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-    Ok(dir)
-}
-
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.into())
 }
 
-/// The ChatGPT and Claude logins kept in the run state, announcing on one channel.
-struct Accounts {
-    openai: OpenAiAccount,
-    claude: ClaudeAccount,
-    events: tokio::sync::broadcast::Receiver<Event>,
-}
-
+/// The ChatGPT and Claude logins kept owner-only in the run state's `accounts/`, announcing on
+/// one channel. ERISGISSCRAPER_OPENAI_AUTH, ERISGISSCRAPER_CLAUDE_API and
+/// ERISGISSCRAPER_CLAUDE_AUTH point them at other servers.
 fn accounts(state: &Path) -> Result<Accounts> {
-    let dir = accounts_dir(state)?;
-    let (events, receiver) = tokio::sync::broadcast::channel(64);
-    let openai_auth = env_or("ERISGISSCRAPER_OPENAI_AUTH", openai::AUTH);
-    let claude_auth = env_or("ERISGISSCRAPER_CLAUDE_AUTH", claude::AUTH);
-    Ok(Accounts {
-        openai: OpenAiAccount::load(dir.join("chatgpt.json"), &openai_auth, APP, events.clone())?,
-        claude: ClaudeAccount::load(dir.join("claude.json"), &endpoints().claude_api, &claude_auth, events)?,
-        events: receiver,
-    })
+    Accounts::load_from(
+        &state.join("accounts"),
+        APP,
+        &env_or("ERISGISSCRAPER_OPENAI_AUTH", openai::AUTH),
+        &env_or("ERISGISSCRAPER_CLAUDE_API", claude::API),
+        &env_or("ERISGISSCRAPER_CLAUDE_AUTH", claude::AUTH),
+    )
 }
 
-fn endpoints() -> Endpoints {
-    Endpoints {
-        codex: env_or("ERISGISSCRAPER_CODEX_API", openai::CODEX_API),
-        claude_api: env_or("ERISGISSCRAPER_CLAUDE_API", claude::API),
-    }
-}
-
-/// Where Claude Code keeps its login: `$CLAUDE_CONFIG_DIR/.credentials.json`, or
-/// `~/.claude/.credentials.json`.
-fn claude_code_credentials() -> Result<PathBuf> {
-    let dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?).join(".claude"),
-    };
-    Ok(dir.join(".credentials.json"))
+/// The Codex endpoint, or ERISGISSCRAPER_CODEX_API.
+fn codex_api() -> String {
+    env_or("ERISGISSCRAPER_CODEX_API", openai::CODEX_API)
 }
 
 /// Every signed-in login's models: Claude's, then ChatGPT's. A login whose listing fails is
 /// reported and left out.
 async fn listed_models(accounts: &Accounts) -> Vec<models::Model> {
-    let endpoints = endpoints();
     let mut listed = Vec::new();
-    if accounts.claude.signed_in().await {
-        match models::list_claude(&accounts.claude, &endpoints.claude_api).await {
-            Ok(models) => listed.extend(models),
-            Err(error) => eprintln!("listing Claude models failed: {error:#}"),
-        }
+    match accounts.claude.models().await {
+        Ok(models) => listed.extend(models),
+        Err(error) => eprintln!("listing Claude models failed: {error:#}"),
     }
-    if accounts.openai.signed_in().await {
-        match models::list_codex(&accounts.openai, &endpoints.codex, APP.originator).await {
-            Ok(models) => listed.extend(models),
-            Err(error) => eprintln!("listing ChatGPT models failed: {error:#}"),
-        }
+    match accounts.openai.models(&codex_api()).await {
+        Ok(models) => listed.extend(models),
+        Err(error) => eprintln!("listing ChatGPT models failed: {error:#}"),
     }
     listed
 }
@@ -215,7 +183,7 @@ async fn main() -> Result<()> {
         Command::Login { claude: Some(path), .. } => {
             let path = match path {
                 Some(path) => path,
-                None => claude_code_credentials()?,
+                None => claude::claude_code_credentials()?,
             };
             let accounts = accounts(&cli.state)?;
             let snapshot = accounts.claude.bind(&path).await?;
@@ -226,8 +194,9 @@ async fn main() -> Result<()> {
             );
         }
         Command::Login { device, claude: None } => {
-            let Accounts { openai: account, mut events, .. } = accounts(&cli.state)?;
-            let start = account.login(if device { Method::DeviceCode } else { Method::Browser }).await?;
+            let accounts = accounts(&cli.state)?;
+            let mut events = accounts.subscribe();
+            let start = accounts.openai.login(if device { Method::DeviceCode } else { Method::Browser }).await?;
             println!("Open {}", start.url);
             if let Some(code) = start.user_code {
                 println!("and enter the code {code}");
@@ -245,7 +214,9 @@ async fn main() -> Result<()> {
         Command::ImportLogin { file } => {
             let credential: openai::Credential =
                 serde_json::from_slice(&std::fs::read(&file)?).context("the file is not a ChatGPT credential")?;
-            let path = accounts_dir(&cli.state)?.join("chatgpt.json");
+            // Loading the accounts makes their owner-only folder.
+            accounts(&cli.state)?;
+            let path = cli.state.join("accounts").join("chatgpt.json");
             let text = serde_json::to_vec_pretty(&serde_json::json!({"version": 1, "credential": credential}))?;
             erisgis::registry::write_atomic(&path, &text)?;
             use std::os::unix::fs::PermissionsExt;
@@ -313,14 +284,15 @@ async fn main() -> Result<()> {
             if ladder.is_empty() {
                 bail!("no model ladder: sign in first (eris-gis-scraper login, or login --claude), or pass --ladder");
             }
-            let providers = models::providers(&accounts.openai, &accounts.claude, &endpoints(), APP.originator).await?;
-            let assistant = Assistant::from_models(&listed, &providers, &accounts.claude, &endpoints().claude_api);
+            let providers = Providers::new(&accounts.openai, &accounts.claude, &codex_api()).await?;
+            let web = providers.web(&listed);
             let work = Arc::new(Work {
                 dataset,
                 counties: all.clone(),
                 registry: Mutex::new(Registry::open(&registry_dir)?),
                 runtime: runtime(&cli.state)?,
-                assistant,
+                web,
+                web_http: erisharness::tools::web::Http::new(Default::default(), erisgis::USER_AGENT)?,
                 agents: Mutex::new(Default::default()),
                 validate_budget,
                 log: Mutex::new(Default::default()),
@@ -330,7 +302,7 @@ async fn main() -> Result<()> {
             let empty = harness_dir.join("empty");
             std::fs::create_dir_all(&empty)?;
             let mut builder = Harness::builder(&harness_dir);
-            for (name, provider) in providers {
+            for (name, provider) in providers.named() {
                 builder = builder.provider(name, provider);
             }
             let harness = builder
@@ -360,7 +332,8 @@ async fn main() -> Result<()> {
             if no_tui {
                 headless(scheduler).await?;
             } else {
-                tui::run(scheduler, accounts.openai, accounts.claude, accounts.events).await?;
+                let events = accounts.subscribe();
+                tui::run(scheduler, accounts.openai, accounts.claude, events).await?;
             }
         }
     }

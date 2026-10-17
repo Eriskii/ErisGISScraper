@@ -238,3 +238,28 @@ async fn a_layer_with_no_parcels_in_the_county_still_fails() {
     assert!(!report.passed);
     assert!(failed(&report).contains(&"features"), "{}", report.summary());
 }
+
+#[tokio::test]
+async fn polygons_that_cross_themselves_are_repaired_and_pass() {
+    let root = server().await;
+    let report = run(&spec(
+        json!({"kind": "arcgis-feature", "url": format!("{root}/arcgis/bowties/FeatureServer/0")}),
+        good_fields(),
+    ))
+    .await;
+    assert!(report.passed, "{}", report.summary());
+    let valid = report.checks.iter().find(|c| c.name == "valid-polygons").unwrap();
+    assert!(valid.detail.contains("repaired"), "{}", valid.detail);
+    assert!(report.repaired > 0 && report.repaired < report.features, "{} of {}", report.repaired, report.features);
+}
+
+#[tokio::test]
+async fn polygons_with_no_area_cannot_be_repaired_and_fail() {
+    let root = server().await;
+    let report = run(&spec(
+        json!({"kind": "arcgis-feature", "url": format!("{root}/arcgis/collapsed/FeatureServer/0")}),
+        good_fields(),
+    ))
+    .await;
+    assert_eq!(failed(&report), ["valid-polygons"], "{}", report.summary());
+}

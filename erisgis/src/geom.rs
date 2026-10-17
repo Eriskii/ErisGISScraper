@@ -1,8 +1,8 @@
-//! Geometry in WGS84 longitude/latitude: bounding boxes, and polygons read from GeoJSON, Esri
-//! JSON and shapefiles into `geo` multipolygons.
+//! Geometry in WGS84 longitude/latitude: bounding boxes, polygons read from GeoJSON, Esri JSON
+//! and shapefiles into `geo` multipolygons, and the repair of invalid ones.
 
 use anyhow::{Result, anyhow, bail};
-use geo::{Coord, LineString, MultiPolygon, Polygon, Winding};
+use geo::{Coord, LineString, MakeValid, MultiPolygon, Polygon, Validation, Winding};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -191,10 +191,81 @@ pub fn from_web_mercator(x: f64, y: f64) -> (f64, f64) {
     (lon, lat)
 }
 
+/// Whether a feature's polygons were valid as read, valid once repaired, or past repair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Shape {
+    Valid,
+    Repaired,
+    Invalid,
+}
+
+/// `geometry` made valid, and whether it had to be. Each invalid polygon is rebuilt from its own
+/// edges (a ring that crosses itself becomes the pieces it encloses, an edge that doubles back
+/// is dropped); parts of the feature that overlap are then merged into their union. A geometry
+/// with nothing left, such as rings collapsed onto a line, comes back as it was, `Invalid`.
+pub fn repair(geometry: MultiPolygon) -> (MultiPolygon, Shape) {
+    if geometry.is_valid() {
+        return (geometry, Shape::Valid);
+    }
+    let mut parts: Vec<Polygon> = Vec::new();
+    for polygon in &geometry.0 {
+        if polygon.is_valid() {
+            parts.push(polygon.clone());
+        } else if let Ok(rebuilt) = polygon.make_valid() {
+            parts.extend(rebuilt.0);
+        }
+    }
+    let mut fixed = MultiPolygon::new(parts);
+    if !fixed.is_valid() {
+        fixed = geo::unary_union(fixed.0.iter());
+    }
+    if fixed.0.is_empty() || !fixed.is_valid() {
+        return (geometry, Shape::Invalid);
+    }
+    (fixed, Shape::Repaired)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use geo::Area;
+    use geo::Validation;
+
+    fn shape(geometry: Value) -> MultiPolygon {
+        from_geojson(&geometry).unwrap()
+    }
+
+    #[test]
+    fn invalid_polygons_are_repaired_and_overlapping_parts_merged() {
+        let square = shape(json!({"type": "Polygon", "coordinates": [[[0, 0], [4, 0], [4, 4], [0, 4], [0, 0]]]}));
+        let (kept, how) = repair(square.clone());
+        assert_eq!((how, &kept), (Shape::Valid, &square), "a valid polygon is left as it is");
+
+        // A bowtie: its boundary crosses itself at (5, 5), making two triangles.
+        let bowtie = shape(json!({"type": "Polygon", "coordinates": [[[0, 0], [0, 10], [10, 0], [10, 10], [0, 0]]]}));
+        assert!(!bowtie.is_valid());
+        let (fixed, how) = repair(bowtie);
+        assert_eq!(how, Shape::Repaired);
+        assert!(fixed.is_valid());
+        assert!((fixed.unsigned_area() - 50.0).abs() < 1e-9, "{}", fixed.unsigned_area());
+
+        // Two overlapping parts of one feature are their union, not what each leaves of the other.
+        let overlapping = shape(json!({"type": "MultiPolygon", "coordinates": [
+            [[[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]]],
+            [[[5, 0], [15, 0], [15, 10], [5, 10], [5, 0]]],
+        ]}));
+        assert!(!overlapping.is_valid());
+        let (merged, how) = repair(overlapping);
+        assert_eq!(how, Shape::Repaired);
+        assert!(merged.is_valid());
+        assert!((merged.unsigned_area() - 150.0).abs() < 1e-9, "{}", merged.unsigned_area());
+
+        // A ring collapsed onto a line has no area to keep.
+        let collapsed = shape(json!({"type": "Polygon", "coordinates": [[[0, 0], [5, 5], [10, 10], [5, 5], [0, 0]]]}));
+        let (left, how) = repair(collapsed.clone());
+        assert_eq!((how, left), (Shape::Invalid, collapsed));
+    }
 
     #[test]
     fn esri_rings_become_polygons_with_holes() {

@@ -1,7 +1,6 @@
 //! What the scheduler and the agents' tools share: the dataset, the counties, its registry, the
 //! runtime, and each live agent's job and progress.
 
-use crate::assist::Assistant;
 use crate::journal::{Job, Tokens};
 use erisgis::Dataset;
 use erisgis::counties::{Counties, County};
@@ -88,8 +87,9 @@ pub struct Work {
     pub counties: Arc<Counties>,
     pub registry: Mutex<Registry>,
     pub runtime: Runtime,
-    /// The models the agents' tools ask: web search and page reading.
-    pub assistant: Assistant,
+    /// The models `web` searches and reads pages with, and the client it reads the web with.
+    pub web: erisharness::tools::web::Models,
+    pub web_http: erisharness::tools::web::Http,
     pub agents: Mutex<HashMap<String, AgentJob>>,
     /// Failed validations an attempt may make before it must stop.
     pub validate_budget: usize,

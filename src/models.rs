@@ -1,40 +1,21 @@
-//! The models agents run on and the providers that serve them: a ChatGPT login's models through
-//! the Codex endpoint, and a Claude login's through the Anthropic API as Claude Code calls it.
-//! Both logins come from ErisAgentAuth. The ladder of models runs cheapest first.
+//! The models agents run on and the providers that serve them. ErisAgentAuth lists each login's
+//! models (ChatGPT's through the Codex endpoint, Claude's through the Anthropic API) and builds
+//! the providers that call them; this is the scraper's policy over them: the ladder of models,
+//! cheapest first.
 
-use anyhow::{Result, bail, ensure};
-use erisagentauth::claude::{self, ClaudeAccount};
+use anyhow::{Result, bail};
+use erisagentauth::claude::ClaudeAccount;
 use erisagentauth::openai::OpenAiAccount;
-use erisharness::provider::{
-    Anthropic, AnthropicAuth, AnthropicConfig, Provider, RateGate, Responses, ResponsesConfig, Thinking,
-};
+use erisharness::provider::{Provider, RateGate};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::sync::Arc;
 
-/// The ChatGPT login's models, through the Codex endpoint.
-pub const CODEX: &str = "codex";
-/// The Claude login's models, through the Anthropic API.
-pub const ANTHROPIC: &str = "anthropic";
-/// The backend lists models by the Codex client version asking; this asks as a current one.
-const CLIENT_VERSION: &str = "99.0.0";
+pub use erisagentauth::models::{ANTHROPIC, CODEX, Model};
+
 /// Claude model families a ladder may name, each meaning the newest listed model of it.
 const CLAUDE_FAMILIES: [&str; 3] = ["haiku", "sonnet", "opus"];
-/// The efforts a Claude model may list, in order.
-const CLAUDE_EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Model {
-    /// [`CODEX`] or [`ANTHROPIC`].
-    pub provider: String,
-    pub id: String,
-    pub name: String,
-    pub context_window: Option<u64>,
-    /// Reasoning efforts the model takes, in the backend's order.
-    pub efforts: Vec<String>,
-    /// Why agents cannot run on this model, when they cannot.
-    pub cannot_run: Option<String>,
-}
+/// Retries a model call makes before its attempt fails.
+const RETRIES: u32 = 6;
 
 /// One rung of the ladder: a model, who serves it, and how hard it thinks.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -52,115 +33,6 @@ impl Rung {
             None => self.model.clone(),
         }
     }
-}
-
-/// Where the providers are: the Codex endpoint, and the Anthropic API's root (without `/v1`).
-pub struct Endpoints {
-    pub codex: String,
-    pub claude_api: String,
-}
-
-/// The ChatGPT login's models, most preferred first.
-pub async fn list_codex(account: &OpenAiAccount, endpoint: &str, originator: &str) -> Result<Vec<Model>> {
-    let credential = account.current().await?;
-    let response = reqwest::Client::new()
-        .get(format!("{}/models?client_version={CLIENT_VERSION}", endpoint.trim_end_matches('/')))
-        .bearer_auth(&credential.access)
-        .header("chatgpt-account-id", &credential.account_id)
-        .header("originator", originator)
-        .send()
-        .await?;
-    let status = response.status();
-    ensure!(status.is_success(), "ChatGPT did not list its models ({status})");
-    Ok(codex_models(&response.json().await?))
-}
-
-/// The Claude login's models, newest first, from the Anthropic API at `api`.
-pub async fn list_claude(account: &ClaudeAccount, api: &str) -> Result<Vec<Model>> {
-    let login = account.current().await?;
-    let client = reqwest::Client::new();
-    let mut models = Vec::new();
-    let mut after: Option<String> = None;
-    loop {
-        let mut request = client
-            .get(format!("{}/v1/models", api.trim_end_matches('/')))
-            .query(&[("limit", "1000")])
-            .bearer_auth(&login.access)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", claude::OAUTH_BETA);
-        if let Some(after) = &after {
-            request = request.query(&[("after_id", after)]);
-        }
-        let response = request.send().await?;
-        let status = response.status();
-        ensure!(status.is_success(), "Anthropic did not list the Claude login's models ({status})");
-        let page: Value = response.json().await?;
-        models.extend(claude_models(&page));
-        match page["last_id"].as_str() {
-            Some(last) if page["has_more"] == true => after = Some(last.to_owned()),
-            _ => return Ok(models),
-        }
-    }
-}
-
-fn codex_models(body: &Value) -> Vec<Model> {
-    body["models"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|m| m["visibility"] == "list")
-        .filter_map(|m| {
-            let id = m["slug"].as_str()?;
-            Some(Model {
-                provider: CODEX.into(),
-                id: id.to_owned(),
-                name: m["display_name"].as_str().unwrap_or(id).to_owned(),
-                context_window: m["context_window"].as_u64(),
-                efforts: m["supported_reasoning_levels"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|l| l["effort"].as_str().map(str::to_owned))
-                    .collect(),
-                cannot_run: None,
-            })
-        })
-        .collect()
-}
-
-/// The Claude models a listing names. Agents run on them with adaptive thinking (see
-/// [`providers`]), at the efforts each model's capabilities list; a model that thinks only on a
-/// budget cannot run.
-fn claude_models(body: &Value) -> Vec<Model> {
-    let supported = |capability: &Value| capability["supported"] == true;
-    body["data"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|m| {
-            let id = m["id"].as_str()?;
-            let capabilities = &m["capabilities"];
-            let adaptive = supported(&capabilities["thinking"]["types"]["adaptive"]);
-            let effort = &capabilities["effort"];
-            Some(Model {
-                provider: ANTHROPIC.into(),
-                id: id.to_owned(),
-                name: m["display_name"].as_str().unwrap_or(id).to_owned(),
-                context_window: m["max_input_tokens"].as_u64(),
-                efforts: CLAUDE_EFFORTS
-                    .iter()
-                    .filter(|level| adaptive && supported(effort) && supported(&effort[**level]))
-                    .map(|level| level.to_string())
-                    .collect(),
-                cannot_run: (!adaptive)
-                    .then(|| format!("{id} does not think adaptively, and agents run on adaptive thinking")),
-            })
-        })
-        .collect()
-}
-
-fn small(model: &Model) -> bool {
-    ["mini", "nano", "spark", "small", "lite"].iter().any(|w| model.id.contains(w))
 }
 
 /// The newest listed Claude model of `family` (haiku, sonnet or opus).
@@ -183,7 +55,7 @@ fn rung(model: &Model, effort: Option<&str>) -> Rung {
 /// alone: its most preferred small model at medium effort, then its flagship at medium and high.
 pub fn default_ladder(models: &[Model]) -> Vec<Rung> {
     let codex: Vec<&Model> = models.iter().filter(|m| m.provider == CODEX).collect();
-    let flagship = codex.iter().find(|m| !small(m));
+    let flagship = codex.iter().find(|m| !m.small());
     let mut ladder = Vec::new();
     if models.iter().any(|m| m.provider == ANTHROPIC) {
         ladder.extend(newest_claude(models, "haiku").map(|m| rung(m, Some("medium"))));
@@ -194,7 +66,7 @@ pub fn default_ladder(models: &[Model]) -> Vec<Rung> {
         }
         return ladder;
     }
-    if let Some(m) = codex.iter().find(|m| small(m)) {
+    if let Some(m) = codex.iter().find(|m| m.small()) {
         ladder.push(rung(m, Some("medium")));
     }
     if let Some(m) = flagship {
@@ -251,74 +123,83 @@ pub fn parse_ladder(text: &str, models: &[Model]) -> Result<Vec<Rung>> {
 }
 
 /// The providers agents run on, each authorized by its ErisAgentAuth account on every request:
-/// [`CODEX`] with the ChatGPT login, and [`ANTHROPIC`] with the Claude login, calling as Claude
-/// Code does.
-pub async fn providers(
-    openai: &OpenAiAccount,
-    claude: &ClaudeAccount,
-    endpoints: &Endpoints,
-    originator: &str,
-) -> Result<Vec<(&'static str, Arc<dyn Provider>)>> {
-    let codex = Responses::new(ResponsesConfig {
-        base_url: endpoints.codex.clone(),
-        headers: vec![
-            ("OpenAI-Beta".into(), "responses=experimental".into()),
-            ("originator".into(), originator.into()),
-        ],
-        store: false,
-        max_retries: 6,
-        credentials: Arc::new(openai.clone()),
-        gate: RateGate::new(16, 256),
-    });
-    let mut config =
-        AnthropicConfig::new(Arc::new(claude.clone()), AnthropicAuth::ClaudeCode(claude.claude_code().await));
-    config.base_url = format!("{}/v1", endpoints.claude_api.trim_end_matches('/'));
-    config.max_retries = 6;
-    // Each agent's reasoning effort reaches Claude as the effort of its adaptive thinking.
-    config.thinking = Thinking::Adaptive { display: false };
-    Ok(vec![(CODEX, Arc::new(codex)), (ANTHROPIC, Arc::new(Anthropic::new(config)?))])
+/// [`CODEX`] with the ChatGPT login at `codex_api`, and [`ANTHROPIC`] with the Claude login,
+/// calling as Claude Code does.
+pub struct Providers {
+    pub codex: Arc<dyn Provider>,
+    pub anthropic: Arc<dyn Provider>,
+}
+
+impl Providers {
+    pub async fn new(openai: &OpenAiAccount, claude: &ClaudeAccount, codex_api: &str) -> Result<Self> {
+        Ok(Self {
+            codex: Arc::new(openai.codex(codex_api, RateGate::new(16, 256), RETRIES)),
+            anthropic: Arc::new(claude.anthropic(RETRIES).await?),
+        })
+    }
+
+    /// Each provider by the name rungs give it.
+    pub fn named(&self) -> Vec<(&'static str, Arc<dyn Provider>)> {
+        vec![(CODEX, self.codex.clone()), (ANTHROPIC, self.anthropic.clone())]
+    }
+
+    /// What `web` searches and reads pages with, from `listed`: with a Claude login, the newest
+    /// Haiku, searching with Claude's hosted search; with ChatGPT alone, its small model,
+    /// searching with OpenAI's.
+    pub fn web(&self, listed: &[Model]) -> erisharness::tools::web::Models {
+        erisagentauth::web_models(listed, self.codex.clone(), self.anthropic.clone())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn codex() -> Vec<Model> {
-        codex_models(&json!({"models": [
-            {"slug": "gpt-9-codex", "visibility": "list", "context_window": 400000, "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}]},
-            {"slug": "gpt-9-codex-mini", "visibility": "list", "context_window": 200000, "supported_reasoning_levels": [{"effort": "medium"}]},
-            {"slug": "hidden", "visibility": "hide"},
-        ]}))
+    /// A listed model: `provider`'s `id` with its context window and efforts.
+    fn model(provider: &str, id: &str, context_window: u64, efforts: &[&str]) -> Model {
+        Model {
+            provider: provider.into(),
+            id: id.into(),
+            name: id.into(),
+            context_window: Some(context_window),
+            efforts: efforts.iter().map(|e| e.to_string()).collect(),
+            cannot_run: None,
+        }
     }
 
-    /// A model as Anthropic lists it, thinking adaptively at `efforts`, or only on a budget when
-    /// `efforts` is `None`.
-    fn listed(id: &str, efforts: Option<&[&str]>) -> Value {
-        let levels: serde_json::Map<String, Value> = ["low", "medium", "high", "xhigh", "max"]
-            .iter()
-            .map(|l| (l.to_string(), json!({"supported": efforts.is_some_and(|e| e.contains(l))})))
-            .collect();
-        json!({"id": id, "max_input_tokens": 200000, "capabilities": {
-            "effort": {"supported": efforts.is_some(), "low": levels["low"], "medium": levels["medium"],
-                "high": levels["high"], "xhigh": levels["xhigh"], "max": levels["max"]},
-            "thinking": {"supported": true, "types": {
-                "adaptive": {"supported": efforts.is_some()}, "enabled": {"supported": true}}}}})
+    fn codex() -> Vec<Model> {
+        vec![
+            model(CODEX, "gpt-9-codex", 400000, &["low", "medium", "high"]),
+            model(CODEX, "gpt-9-codex-mini", 200000, &["medium"]),
+        ]
     }
 
     const ALL: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
     fn claude() -> Vec<Model> {
-        claude_models(&json!({"data": [
-            listed("claude-sonnet-9", Some(ALL)),
-            listed("claude-haiku-9", Some(ALL)),
-            listed("claude-haiku-8", None),
-            listed("claude-opus-9", Some(&["low", "medium", "high"])),
-        ]}))
+        let budget_only = Model {
+            cannot_run: Some("claude-haiku-8 thinks only on a budget, and agents run on adaptive thinking".into()),
+            ..model(ANTHROPIC, "claude-haiku-8", 200000, &[])
+        };
+        vec![
+            model(ANTHROPIC, "claude-sonnet-9", 200000, ALL),
+            model(ANTHROPIC, "claude-haiku-9", 200000, ALL),
+            budget_only,
+            model(ANTHROPIC, "claude-opus-9", 200000, &["low", "medium", "high"]),
+        ]
     }
 
     fn labels(ladder: &[Rung]) -> Vec<String> {
         ladder.iter().map(|r| format!("{}/{}", r.provider, r.label())).collect()
+    }
+
+    #[test]
+    fn with_chatgpt_alone_the_ladder_starts_on_its_small_model() {
+        let listed = vec![
+            model(CODEX, "gpt-6.1-sol", 400000, &["low", "high"]),
+            model(CODEX, "gpt-6-luna", 200000, &["low", "medium"]),
+        ];
+        assert_eq!(default_ladder(&listed)[0].model, "gpt-6-luna");
     }
 
     #[test]

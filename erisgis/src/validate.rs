@@ -6,9 +6,10 @@
 use crate::counties::County;
 use crate::dataset::Dataset;
 use crate::geom::Bbox;
+use crate::geom::Shape;
 use crate::runtime::{Fetch, Runtime};
 use crate::spec::{Source, Spec};
-use geo::{Centroid, Validation};
+use geo::Centroid;
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -45,6 +46,8 @@ pub struct Report {
     many: &'static str,
     pub sample_bbox: Option<Bbox>,
     pub features: usize,
+    /// Features whose polygons were invalid as the source has them and were repaired.
+    pub repaired: usize,
     pub pages: usize,
     /// Share of features with each mapped field filled in.
     pub fill: BTreeMap<String, f64>,
@@ -66,6 +69,7 @@ impl Report {
             checks: Vec::new(),
             sample_bbox: None,
             features: 0,
+            repaired: 0,
             pages: 0,
             fill: BTreeMap::new(),
             attribute_names: Vec::new(),
@@ -234,11 +238,17 @@ async fn checks(runtime: &Runtime, dataset: &Dataset, spec: &Spec, county: &Coun
         lon_lat == n,
         format!("{lon_lat} of {n} {many} have longitude/latitude coordinates; the others are projected"),
     );
-    let valid = fetch.features.iter().filter(|p| !p.geometry.0.is_empty() && p.geometry.is_valid()).count();
+    let invalid = fetch.features.iter().filter(|f| f.geometry.0.is_empty() || f.shape == Shape::Invalid).count();
+    let valid = n - invalid;
+    report.repaired = fetch.features.iter().filter(|f| f.shape == Shape::Repaired).count();
     report.check(
         "valid-polygons",
         share(valid, n) >= VALID_SHARE,
-        format!("{valid} of {n} polygons are valid ({:.0}% needed)", VALID_SHARE * 100.0),
+        format!(
+            "{valid} of {n} polygons are valid, {} of them repaired; the other {invalid} are past repair ({:.0}% needed)",
+            report.repaired,
+            VALID_SHARE * 100.0
+        ),
     );
     let centroids: Vec<_> = fetch.features.iter().filter_map(|f| f.geometry.centroid()).collect();
     // Near the box: a feature's extent meets the box grown a little. A large district's centroid

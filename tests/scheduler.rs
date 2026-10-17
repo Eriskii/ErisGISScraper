@@ -4,21 +4,19 @@
 
 mod support;
 
-use erisagentauth::App;
-use erisagentauth::claude::ClaudeAccount;
-use erisagentauth::openai::OpenAiAccount;
+use erisagentauth::{Accounts, App};
 use erisgis::counties::Counties;
 use erisgis::http::{Http, Limits};
 use erisgis::registry::Registry;
 use erisgis::runtime::{Runtime, VALIDATE_WITHIN};
-use erisgisscraper::assist::Assistant;
 use erisgisscraper::journal::{Event, Journal, Outcome};
-use erisgisscraper::models::{self, CODEX, Endpoints, Rung};
+use erisgisscraper::models::{self, CODEX, Providers, Rung};
 use erisgisscraper::scheduler::{Scheduler, Settings};
 use erisgisscraper::tools;
 use erisgisscraper::work::Work;
 use erisharness::Harness;
 use erisharness::provider::{Provider, RateGate, Responses, ResponsesConfig, StaticToken};
+use erisharness::tools::web::Models;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -51,13 +49,13 @@ async fn scheduler_for(
         credentials: Arc::new(StaticToken("token".into())),
         gate: RateGate::new(16, 64),
     }));
-    scheduler_on(dir, vec![(CODEX, provider)], Assistant::default(), ladder(), counties, statewide, dataset).await
+    scheduler_on(dir, vec![(CODEX, provider)], Models::default(), ladder(), counties, statewide, dataset).await
 }
 
 async fn scheduler_on(
     dir: &Path,
     providers: Vec<(&'static str, Arc<dyn Provider>)>,
-    assistant: Assistant,
+    web: Models,
     ladder: Vec<Rung>,
     counties: Vec<String>,
     statewide: bool,
@@ -73,7 +71,12 @@ async fn scheduler_on(
             cache: dir.join("cache"),
             validate_within: VALIDATE_WITHIN,
         },
-        assistant,
+        web,
+        web_http: erisharness::tools::web::Http::new(
+            erisharness::tools::web::Limits { allow_private: true, ..Default::default() },
+            "erisgisscraper-test",
+        )
+        .unwrap(),
         agents: Mutex::default(),
         validate_budget: 3,
         log: Mutex::default(),
@@ -300,20 +303,24 @@ async fn claude_rungs_run_on_the_bound_claude_code_login() {
 
     let credentials = dir.path().join("claude-code.json");
     claude_code_file(&credentials, "from-claude-code");
-    let (events, _) = tokio::sync::broadcast::channel(16);
     let app = App { name: "test", originator: "test" };
-    let openai = OpenAiAccount::load(dir.path().join("chatgpt.json"), &model.url, app, events.clone()).unwrap();
-    let claude = ClaudeAccount::load(dir.path().join("claude.json"), &model.url, &model.url, events).unwrap();
-    claude.bind(&credentials).await.unwrap();
+    let accounts = Accounts::load_from(&dir.path().join("accounts"), app, &model.url, &model.url, &model.url).unwrap();
+    accounts.claude.bind(&credentials).await.unwrap();
 
-    let endpoints = Endpoints { codex: model.url.clone(), claude_api: model.url.clone() };
-    let listed = models::list_claude(&claude, &endpoints.claude_api).await.unwrap();
+    let listed = accounts.claude.models().await.unwrap();
     let ladder = models::parse_ladder("haiku:low, sonnet:high", &listed).unwrap();
-    let providers = models::providers(&openai, &claude, &endpoints, "test").await.unwrap();
-    let assistant = Assistant::from_models(&listed, &providers, &claude, &endpoints.claude_api);
-    let run =
-        scheduler_on(dir.path(), providers, assistant, ladder, vec!["55025".into()], false, &erisgis::parcels::PARCELS)
-            .await;
+    let providers = Providers::new(&accounts.openai, &accounts.claude, &model.url).await.unwrap();
+    let web = providers.web(&listed);
+    let run = scheduler_on(
+        dir.path(),
+        providers.named(),
+        web,
+        ladder,
+        vec!["55025".into()],
+        false,
+        &erisgis::parcels::PARCELS,
+    )
+    .await;
     tokio::time::timeout(Duration::from_secs(60), run.run()).await.unwrap().unwrap();
 
     let registry = Registry::open(&dir.path().join("registry")).unwrap();

@@ -1,7 +1,8 @@
 //! Reads features through a spec: those of its source within a bounding box, each with its
-//! geometry in longitude/latitude, its source attributes, and the normalized fields.
+//! geometry in longitude/latitude (repaired when the source's is invalid), its source
+//! attributes, and the normalized fields.
 
-use crate::geom::{self, Bbox};
+use crate::geom::{self, Bbox, Shape};
 use crate::http::Http;
 use crate::spec::{BulkFormat, Source, Spec};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -17,8 +18,11 @@ const PAGE_CAP: usize = 64 << 20;
 const BULK_CAP: usize = 768 << 20;
 
 pub struct Feature {
+    /// Valid: repaired when the source's was not, unless it was past repair.
     pub geometry: MultiPolygon,
     pub attributes: Map<String, Value>,
+    /// Whether the source's polygons were valid, needed repair, or are past it.
+    pub shape: Shape,
 }
 
 impl Feature {
@@ -97,6 +101,11 @@ impl Runtime {
         if let Some(first) = fetch.features.first() {
             fetch.attribute_names = first.attributes.keys().cloned().collect();
         }
+        for feature in &mut fetch.features {
+            let (geometry, shape) =
+                geom::repair(std::mem::replace(&mut feature.geometry, MultiPolygon::new(Vec::new())));
+            (feature.geometry, feature.shape) = (geometry, shape);
+        }
         Ok(fetch)
     }
 
@@ -164,6 +173,7 @@ impl Runtime {
                     fetch.features.push(Feature {
                         geometry: geom::from_esri(&feature["geometry"])?,
                         attributes: feature["attributes"].as_object().cloned().unwrap_or_default(),
+                        shape: Shape::Valid,
                     });
                 }
             }
@@ -351,6 +361,7 @@ fn read_geojson_features(body: &Value, into: &mut Vec<Feature>) -> Result<()> {
         into.push(Feature {
             geometry: geom::from_geojson(&feature["geometry"])?,
             attributes: feature["properties"].as_object().cloned().unwrap_or_default(),
+            shape: Shape::Valid,
         });
     }
     Ok(())
@@ -399,7 +410,7 @@ fn read_shapefile_zip(bytes: &[u8], into: &mut Vec<Feature>) -> Result<()> {
             };
             attributes.insert(name, value);
         }
-        into.push(Feature { geometry, attributes });
+        into.push(Feature { geometry, attributes, shape: Shape::Valid });
     }
     Ok(())
 }

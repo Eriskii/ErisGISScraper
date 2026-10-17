@@ -136,20 +136,31 @@ async fn respond_anthropic(State(shared): State<Shared>, headers: HeaderMap, bod
     let reply = (shared.brain)(&request);
     shared.requests.lock().unwrap().push(request);
     if web_search {
-        // One whole answer: the search, its results (titled from the URLs the brain's lines
-        // name), and the brain's lines.
+        // The search, its results (titled from the URLs the brain's lines name), and the
+        // brain's lines, streamed as Anthropic streams a hosted search.
         let Reply::Says(lines) = reply else { panic!("a search request is answered with text") };
         let results: Vec<Value> = lines
             .lines()
             .filter_map(|l| l.split_once(" — "))
             .map(|(url, _)| json!({"type": "web_search_result", "url": url.trim(), "title": format!("Title of {}", url.trim()), "encrypted_content": "x"}))
             .collect();
-        return axum::Json(json!({"type": "message", "role": "assistant", "content": [
-            {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "q"}},
-            {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": results},
-            {"type": "text", "text": lines},
-        ], "stop_reason": "end_turn", "usage": {"input_tokens": 300, "cache_read_input_tokens": 0, "output_tokens": 40}}))
-        .into_response();
+        let blocks = [
+            json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {"query": "q"}}),
+            json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "content": results}),
+            json!({"type": "text", "text": lines}),
+        ];
+        let mut events = vec![
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 300, "cache_read_input_tokens": 0, "output_tokens": 1}}}),
+        ];
+        for (index, block) in blocks.into_iter().enumerate() {
+            events.push(json!({"type": "content_block_start", "index": index, "content_block": block}));
+            events.push(json!({"type": "content_block_stop", "index": index}));
+        }
+        events.extend([
+            json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 40}}),
+            json!({"type": "message_stop"}),
+        ]);
+        return sse(&events);
     }
     let (block, delta, stop) = match reply {
         Reply::Hangs => {

@@ -1,10 +1,9 @@
 //! ErisHarness agents that find, write and validate an ErisGIS adapter for every US county, one
 //! dataset at a time: the scheduler and its model ladder, the journal a run resumes from, the
-//! agents' command-line tools, the terminal view and the field notes. The specs, registry,
+//! agents' command-line tools (ErisHarness's `web` among them), the terminal view and the field
+//! notes. The specs, registry,
 //! runtime and validator they work through are the `erisgis` crate's.
 
-pub mod assist;
-pub mod cli;
 pub mod journal;
 pub mod models;
 pub mod notes;

@@ -2,13 +2,13 @@
 //! no usable service. Statewide searches get the same command as `statewide_spec`, without
 //! `unavailable`.
 
-use crate::cli;
 use crate::journal::Job;
 use crate::work::{Resolution, Validated, Work};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use erisgis::Dataset;
 use erisgis::registry::now;
 use erisgis::spec::{Reason, SPEC_VERSION, Spec, Unavailable};
+use erisharness::tools::cli;
 use erisharness::tools::{Tool, ToolContext, ToolOutput};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};

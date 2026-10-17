@@ -149,6 +149,16 @@ async fn arcgis(
                     let first = points[0].clone();
                     points.push(first);
                 }
+                // Like layers digitized carelessly: every third parcel's ring crosses itself (two
+                // corners swapped), or collapses onto its diagonal.
+                if p.id.is_multiple_of(3) && (variant == "bowties" || variant == "collapsed") {
+                    let [w, s, e, n] = p.bounds;
+                    coordinates = if variant == "bowties" {
+                        json!([[w, s], [e, n], [e, s], [w, n], [w, s]])
+                    } else {
+                        json!([[w, s], [e, n], [w, s], [e, n], [w, s]])
+                    };
+                }
                 if variant == "mercator" {
                     for point in coordinates.as_array_mut().unwrap() {
                         let (x, y) = mercator_inverse(point[0].as_f64().unwrap(), point[1].as_f64().unwrap());
@@ -286,7 +296,6 @@ pub async fn serve(grid: Grid) -> String {
         .route("/zoning/FeatureServer/0/query", get(zoning))
         .route("/wfs", get(wfs))
         .route("/ogc/collections/parcels/items", get(ogc))
-        .route("/ddg", get(duckduckgo))
         .route("/page", get(page))
         .with_state(Arc::new(grid));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -306,18 +315,4 @@ async fn page() -> Response {
         "<html><body><h1>County GIS</h1>{filler}<a href=\"/arcgis/good/FeatureServer/0\">Parcels service</a></body></html>"
     ))
     .into_response()
-}
-
-/// DuckDuckGo's HTML results page, with ten results.
-async fn duckduckgo(Query(q): Query<HashMap<String, String>>) -> Response {
-    let query = q.get("q").cloned().unwrap_or_default();
-    let results: String = (0..10)
-        .map(|i| {
-            format!(
-                "<div class=\"result\"><a class=\"result__a\" href=\"//duckduckgo.com/l/?uddg=https%3A%2F%2Fcounty{i}.example.gov%2Fgis\">County {i} GIS for {query}</a>\
-                 <a class=\"result__snippet\" href=\"x\">Parcel maps of county {i}.</a></div>"
-            )
-        })
-        .collect();
-    axum::response::Html(format!("<html><body>{results}</body></html>")).into_response()
 }

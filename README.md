@@ -98,7 +98,11 @@ city in it that does); a record is searched again after 180 days, or 365 for `pa
 - **longitude-latitude**, **location**, **in-county**: coordinates are degrees, lie where they
   were asked for (each feature's extent meets the sample box), and mostly inside the county's
   boundary. Swapped axes and projected coordinates fail here.
-- **valid-polygons**: 90% of polygons are valid.
+- **valid-polygons**: 90% of polygons are valid as the source has them or once repaired. The
+  runtime repairs every invalid feature it reads: a ring that crosses itself becomes the pieces
+  it encloses, an edge that doubles back is dropped, and overlapping parts of one feature merge
+  into their union. A feature with no area left, such as a ring collapsed onto a line, is past
+  repair. The report says how many were repaired.
 - **fields-mapped**, **field-fill**: at least one of the dataset's identifying fields is mapped
   (parcels: `apn`, `address` or `owner`; zoning: `zone` or `zone_name`); every mapped attribute
   exists and is filled for half the features or more.
@@ -129,7 +133,8 @@ the URLs).
    `--attempts-per-rung`), briefed with the last attempt's own summary and its validation
    results. The rung that succeeds is recorded in the spec and the journal. Each rung runs on
    the provider that serves its model: Codex for the ChatGPT login, the Anthropic API for the
-   Claude login. The default ladder comes from the signed-in logins' model listings: with a
+   Claude login, both built by ErisAgentAuth. The default ladder comes from the signed-in
+   logins' model listings, which ErisAgentAuth fetches: with a
    Claude login, the newest Haiku at medium effort, then Sonnet at high, then ChatGPT's flagship
    (or Opus without ChatGPT) at high; with ChatGPT alone, its small model at medium effort, then
    its flagship at medium and high. Claude models think adaptively, at the rung's effort; a rung
@@ -137,9 +142,11 @@ the URLs).
    4.5 generation) cannot run.
 
 Agents' tools are three command lines, each called with one `command` string, split as a
-shell splits words (quotes, backslashes, no expansion) and parsed with clap. Their help is in
-the tool description and behind `--help`; a parse error comes back as the tool's error. They
-run in-process: there is no shell, no file system and no sandbox.
+shell splits words (quotes, backslashes, no expansion) and parsed with clap through
+ErisHarness's `tools::cli`. Their help is in the tool description and behind `--help`; a parse
+error comes back as the tool's error. They run in-process: there is no shell, no file system
+and no sandbox. `web` is [ErisHarness](https://github.com/Eriskii/ErisHarness)'s, set up with
+the run's models; `arcgis` and `spec` are the scraper's.
 
 ```text
 web search <query…>                                         up to 8 results: title, URL, one line
@@ -154,12 +161,12 @@ spec unavailable <reason> --evidence <url>… --note "…"      county jobs only
 ```
 
 `web search` and `web read` run on models of their own, so only their few lines enter the agent's
-context. With a Claude login, the newest Haiku searches with Claude's server-side web search (one
-Messages request made as Claude Code makes them) and reads pages at low effort; with ChatGPT alone,
-its small model reads and search falls back to DuckDuckGo's results page. A reader gets up to
-120,000 characters of a page and answers with the URLs it relied on. The tokens these calls spend
-count toward the agent's attempt, and each attempt's `finished` line in the journal lists them by
-command under `tools`.
+context. With a Claude login, the newest Haiku searches with Claude's hosted web search and reads
+pages, at low effort; with ChatGPT alone, its small model does both, searching with OpenAI's hosted
+web search on the Codex endpoint. Search falls back to DuckDuckGo's results page when neither can
+search. A reader gets up to 120,000 characters of a page and answers with the URLs it relied on.
+The tokens these calls spend count toward the agent's attempt, and each attempt's `finished` line
+in the journal lists them by command under `tools`.
 
 `--grep` takes a case-insensitive regular expression and is how agents cut a long answer, such as
 a services directory, down to the lines they need. Statewide searches get the same `spec` as
@@ -226,12 +233,13 @@ about 30 m. It is embedded in the binary; `regenerate-counties` rebuilds it.
 
 `cargo test --workspace` runs `erisgis`'s validator, lookup and zoning tests and the
 scraper's. They cover the command-line tools as agents call them (help, parse errors, quoting,
-`--grep`, the spec workflow, search and page reading on a stand-in Claude API and their fallbacks), the validator against a fake county server on loopback (ArcGIS GeoJSON and
+`--grep`, the spec workflow, and `web` as the scraper sets it up: its command lines in the terminal view and its search and reading tokens charged to the job, on a stand-in Claude API; ErisHarness tests the tool itself), the validator against a fake county server on loopback (ArcGIS GeoJSON and
 Esri JSON, a latitude-first WFS, OGC API Features, and broken variants: projected coordinates,
 ignored offsets, refusals, missing fields), zoning on a fake zoning layer (validation, a county read through several jurisdictions' layers,
 district classes, each dataset's spec help and reasons), and whole runs against a stand-in
 model: an agent that gives up and hands over to the next rung, a statewide layer covering its
 counties without county agents, a county marked unavailable, a run stopped mid-turn that
 resumes its agent, and a zoning agent asked once about the jurisdictions its layer left out.
-`ERISGISSCRAPER_LIVE_STATE=<state dir> cargo test --test live -- --ignored --nocapture` runs one
-real search and one real page read on the Claude login bound in that state directory.
+`ERISGISSCRAPER_LIVE_STATE=<state dir> cargo test --test live -- --ignored --nocapture` runs a
+real search and page read on each login in that state directory: the bound Claude login, and the
+ChatGPT login alone.

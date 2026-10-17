@@ -10,7 +10,7 @@ features through them, proves a spec works, and reads what a map view's box hold
 | `dataset`, `parcels`, `zoning` | What differs between datasets: fields, sampling, how features become map features, unavailable reasons, agent instructions |
 | `spec` | The adapter spec and the unavailable record |
 | `registry` | A dataset's registry folder: `adapters/`, `unavailable/`, `index.json` |
-| `runtime` | Features in a box through a spec: ArcGIS REST, WFS, OGC API Features, bulk downloads |
+| `runtime` | Features in a box through a spec: ArcGIS REST, WFS, OGC API Features, bulk downloads; invalid polygons repaired (`geom::repair`) |
 | `validate` | Runs a spec for a county and reports every check |
 | `lookup` | A map view's box: the counties it crosses, the adapters each reads through, the features |
 | `counties` | Every county's boundary, embedded |

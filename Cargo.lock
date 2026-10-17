@@ -737,7 +737,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "erisagentauth"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -802,11 +802,13 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "bytes",
+ "clap",
  "erissandbox",
  "futures-util",
  "httpdate",
  "libc",
  "nix 0.31.3",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",
@@ -816,6 +818,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "unicode-normalization",
+ "url",
  "uuid",
  "xxhash-rust",
 ]
