@@ -50,5 +50,6 @@ pub const PARCELS: Dataset = Dataset {
         search: "parcels",
         saved: "Your job is done: reply with one line saying what you saved.",
         follow_up: "",
+        jurisdictions_goal: "",
     },
 };

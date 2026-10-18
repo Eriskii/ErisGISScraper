@@ -191,7 +191,23 @@ impl Http {
     }
 }
 
+/// What an answer said, short: an HTML page (a login, a block page) by its title, anything else
+/// by its first 300 characters.
 fn snippet(text: &str) -> String {
+    let page = text.trim_start();
+    // ASCII lowercasing keeps every byte where it is, so positions found in it hold in `page`.
+    let lower = page.to_ascii_lowercase();
+    if lower.starts_with("<!doctype html") || lower.starts_with("<html") {
+        let title = lower.find("<title").and_then(|start| {
+            let open = start + lower[start..].find('>')? + 1;
+            let close = open + lower[open..].find("</title")?;
+            Some(page[open..close].split_whitespace().collect::<Vec<_>>().join(" "))
+        });
+        return match title.filter(|t| !t.is_empty()) {
+            Some(title) => format!("an HTML page titled \"{}\"", title.chars().take(120).collect::<String>()),
+            None => "an HTML page".into(),
+        };
+    }
     text.chars().take(300).collect()
 }
 
@@ -219,6 +235,19 @@ mod tests {
         for ip in ["8.8.8.8", "52.1.2.3", "2606:4700::1111"] {
             assert!(!private(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[test]
+    fn an_html_answer_is_named_by_its_title() {
+        let page = "<!DOCTYPE html>\n<html lang=\"en\"><head><meta name=\"robots\" content=\"noindex\">\
+                    <title>\n  Access Denied </title></head><body>…</body></html>";
+        assert_eq!(snippet(page), "an HTML page titled \"Access Denied\"");
+        assert_eq!(snippet("<html><body>no title</body></html>"), "an HTML page");
+        assert_eq!(
+            snippet("<html><head><title>Zürich — Zugriff verweigert</title>"),
+            "an HTML page titled \"Zürich — Zugriff verweigert\""
+        );
+        assert_eq!(snippet("{\"error\": \"x\"}"), "{\"error\": \"x\"}");
     }
 
     #[tokio::test]

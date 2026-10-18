@@ -259,10 +259,12 @@ async fn a_zoning_agent_submits_each_jurisdictions_layer() {
     let dir = tempfile::tempdir().unwrap();
     let work = work_on(dir.path(), Job::County("55025".into()), Models::default(), &ZONING);
     let spec = SpecTool { work: work.clone(), statewide: false };
+    // Each jurisdiction's layer: the same server's, picked out by a filter (which it ignores).
     let layer = |id: &str| {
         json!({"id": id, "publisher": "Dane County", "official": true,
                "source": {"kind": "arcgis-feature", "url": format!("{root}/zoning/FeatureServer/0"), "page_size": 4},
-               "coverage": {"counties": ["55025"]}, "fields": {"zone": "ZONING", "zone_name": "ZONE_DESC"}})
+               "coverage": {"counties": ["55025"]}, "fields": {"zone": "ZONING", "zone_name": "ZONE_DESC"},
+               "filter": format!("MUNI = '{id}'").replace('\'', "")})
     };
     for id in ["wi-dane", "wi-madison"] {
         let validated = text(&spec.run("agent", &format!("validate '{}'", layer(id))).await);
@@ -271,6 +273,12 @@ async fn a_zoning_agent_submits_each_jurisdictions_layer() {
         assert!(saved.contains(&format!("Saved {id}")) && saved.contains("other jurisdictions"), "{saved}");
     }
     assert_eq!(work.registry.lock().unwrap().index["55025"], ["wi-dane", "wi-madison"]);
+    // The whole layer, unfiltered, holds both: it is not saved beside them.
+    let mut whole = layer("wi-dane-all");
+    whole.as_object_mut().unwrap().remove("filter");
+    assert!(text(&spec.run("agent", &format!("validate '{whole}'")).await).contains("\"passed\": true"));
+    let refused = text(&spec.run("agent", "submit").await);
+    assert!(refused.contains("part of that layer is saved already as wi-dane"), "{refused}");
     let refused = spec.run("agent", "unavailable no-public-gis --evidence https://x.org --note x").await;
     assert!(refused.is_error, "a county with a saved layer is not unavailable");
 }

@@ -70,7 +70,9 @@ impl Arcgis {
                             None => return ToolOutput::error(format!("no state {state}")),
                         }
                     }
-                    (None, Some(Job::County(fips))) => self.0.counties.get(&fips).map(|c| c.bbox),
+                    (None, Some(Job::County(fips) | Job::Jurisdictions(fips))) => {
+                        self.0.counties.get(&fips).map(|c| c.bbox)
+                    }
                     (None, Some(Job::State(state))) => union(self.0.counties.in_state(&state).map(|c| c.bbox)),
                     (None, None) => None,
                 };

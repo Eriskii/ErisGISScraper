@@ -16,6 +16,9 @@ pub enum Job {
     State(String),
     /// The search for one county's layers, by FIPS.
     County(String),
+    /// In a dataset taken per jurisdiction, a pass over a covered county, by FIPS, for the
+    /// jurisdictions its saved layers leave out.
+    Jurisdictions(String),
 }
 
 impl Job {
@@ -23,6 +26,7 @@ impl Job {
         match self {
             Job::State(state) => format!("state {state}"),
             Job::County(fips) => format!("county {fips}"),
+            Job::Jurisdictions(fips) => format!("county {fips} (jurisdictions)"),
         }
     }
 }
@@ -30,8 +34,13 @@ impl Job {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
-    /// An adapter now covers the county, or for a state job, the search ended.
-    Done { detail: String },
+    /// An adapter now covers the county, or for a state job or a jurisdictions pass, the search
+    /// ended. `more`: the pass saved as many layers as one may, so another is due.
+    Done {
+        detail: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        more: bool,
+    },
     /// The county was recorded as unavailable.
     Unavailable { reason: String },
     /// The agent ran out of validation attempts or stopped without a result.
@@ -100,6 +109,19 @@ pub struct JobHistory {
     pub tokens: Tokens,
     /// The highest rung started.
     pub rung: usize,
+    /// Results in a row that asked for another pass (a jurisdictions pass's `more`).
+    pub streak: usize,
+}
+
+impl JobHistory {
+    /// Counts a result toward the streak of those asking for another pass.
+    pub fn note(&mut self, outcome: &Outcome) {
+        match outcome {
+            Outcome::Done { more: true, .. } => self.streak += 1,
+            Outcome::Done { more: false, .. } | Outcome::Unavailable { .. } => self.streak = 0,
+            Outcome::GaveUp { .. } | Outcome::Failed { .. } => {}
+        }
+    }
 }
 
 pub struct Journal {
@@ -178,6 +200,7 @@ pub fn replay(events: &[Event]) -> BTreeMap<Job, JobHistory> {
                         history.rung = 0;
                     }
                 }
+                history.note(outcome);
                 history.finished = Some(outcome.clone());
             }
             Event::Checked { .. } => {}

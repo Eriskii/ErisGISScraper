@@ -33,6 +33,10 @@ pub struct Spec {
     /// Free text: licensing, terms of use, update frequency, quirks.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub notes: String,
+    /// Where the layer's features lie, in longitude and latitude, as its source says when it is
+    /// saved; a box this misses is not read from it. Unknown for sources that do not say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent: Option<crate::geom::Bbox>,
     /// Filled in by the validator: when the spec last passed, for which counties, and which
     /// rung of the model ladder wrote it.
     #[serde(default)]

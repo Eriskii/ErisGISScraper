@@ -1,6 +1,7 @@
 //! Field notes from a run, as Markdown: where the registry stands, the counties recorded
 //! unavailable by reason with their evidence, the counties agents could not finish grouped by
-//! what stopped them, the hosts behind the most trouble, and what the run cost.
+//! what stopped them, the hosts behind the most trouble, the jurisdictions passes over covered
+//! counties and what each last said, and what the run cost.
 
 use crate::journal::{Event, Job, Outcome, Tokens};
 use erisgis::counties::Counties;
@@ -49,6 +50,8 @@ fn tokens_line(tokens: &Tokens) -> String {
 /// The notes for `registry` and the run its `events` tell, at `now` (Unix milliseconds).
 pub fn notes(counties: &Counties, registry: &Registry, events: &[Event], now: u64) -> String {
     let mut last: HashMap<&str, Last> = HashMap::new();
+    // Each county's jurisdictions passes: how many ended, and the last one's outcome.
+    let mut passes: BTreeMap<&str, (usize, &Outcome)> = BTreeMap::new();
     let mut total = Tokens::default();
     let mut by_model: BTreeMap<String, (usize, Tokens)> = BTreeMap::new();
     let mut tools: BTreeMap<&str, Tokens> = BTreeMap::new();
@@ -67,8 +70,15 @@ pub fn notes(counties: &Counties, registry: &Registry, events: &[Event], now: u6
                 for (name, spent) in used {
                     tools.entry(name).or_default().add(spent);
                 }
-                if let Job::County(fips) = job {
-                    last.insert(fips, Last { rung: *rung, outcome });
+                match job {
+                    Job::County(fips) => {
+                        last.insert(fips, Last { rung: *rung, outcome });
+                    }
+                    Job::Jurisdictions(fips) => {
+                        let entry = passes.entry(fips).or_insert((0, outcome));
+                        *entry = (entry.0 + 1, outcome);
+                    }
+                    Job::State(_) => {}
                 }
             }
             Event::Checked { .. } => {}
@@ -177,6 +187,25 @@ pub fn notes(counties: &Counties, registry: &Registry, events: &[Event], now: u6
         let _ = writeln!(out, "- `{host}`: {} counties ({})", names.len(), names.join(", "));
     }
 
+    if !passes.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n## Jurisdictions passes ({} count{})\n",
+            passes.len(),
+            if passes.len() == 1 { "y" } else { "ies" }
+        );
+        for (fips, (count, outcome)) in &passes {
+            let name = counties.get(fips).map_or(fips.to_string(), |c| c.label());
+            let said = match outcome {
+                Outcome::Done { detail, .. } => shorten(detail, 600),
+                Outcome::Failed { error } => format!("failed: {}", shorten(error, 300)),
+                Outcome::GaveUp { summary } => shorten(summary, 600),
+                Outcome::Unavailable { reason } => reason.clone(),
+            };
+            let _ = writeln!(out, "- **{name}** ({count} pass{}): {said}", if *count == 1 { "" } else { "es" });
+        }
+    }
+
     let _ = writeln!(out, "\n## What it cost\n");
     let _ = writeln!(out, "All attempts: {}.\n", tokens_line(&total));
     let _ = writeln!(out, "| Model | Attempts | Tokens |\n|---|---:|---|");
@@ -237,7 +266,18 @@ mod tests {
                 "Every request to https://ags.bhamaps.com/arcgisserver/rest/services/{county}/MapServer/0 fails with \"error sending request\"."
             ),
         };
+        let pass = |detail: &str, more: bool| Event::Finished {
+            at: 2,
+            job: Job::Jurisdictions("26163".into()),
+            rung: 0,
+            agent: "d".into(),
+            outcome: Outcome::Done { detail: detail.into(), more },
+            tokens: Tokens::default(),
+            tools: BTreeMap::new(),
+        };
         let events = [
+            pass("Saved mi-wayne-dearborn. Livonia is left.", true),
+            pass("Saved mi-wayne-livonia. Hamtramck publishes its zoning only as a PDF.", false),
             started("17117", "a", "claude-haiku-5-5"),
             finished("17117", 2, "a", cert("MacoupinIL")),
             started("17101", "b", "claude-sonnet-5-5"),
@@ -286,5 +326,10 @@ mod tests {
         assert!(text.contains("| Agents could not finish | 3 |"));
         assert!(text.contains("| claude-haiku-5-5 | 2 | 200 in (100 cached), 20 out |"), "{text}");
         assert!(text.contains("`web read`: 60 in (0 cached), 6 out"));
+        assert!(
+            section("## Jurisdictions passes (1 county)")
+                .contains("**Wayne County, MI (26163)** (2 passes): Saved mi-wayne-livonia. Hamtramck publishes"),
+            "{text}"
+        );
     }
 }

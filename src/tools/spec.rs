@@ -1,9 +1,10 @@
 //! `spec`: validate adapter specs, look at the last one, save it, or record that a county has
 //! no usable service. Statewide searches get the same command as `statewide_spec`, without
-//! `unavailable`.
+//! `unavailable`. A saved spec records where its layer lies; a layer saved already for the county
+//! is not saved again.
 
 use crate::journal::Job;
-use crate::work::{Resolution, Validated, Work};
+use crate::work::{LAYERS_PER_PASS, Resolution, Validated, Work};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use erisgis::Dataset;
 use erisgis::registry::now;
@@ -94,6 +95,14 @@ enum Command {
     Show,
     /// Save the spec validated last to the registry, if it passed.
     Submit,
+    /// In a pass over a covered county for its other jurisdictions: name those you did not get
+    /// to check, before you reply. The next pass starts from them.
+    #[command(after_help = "Example: spec left Taylor, Grosse Pointe Park, Hamtramck")]
+    Left {
+        /// The jurisdictions, separated by commas (or each quoted).
+        #[arg(required = true, num_args = 1..)]
+        jurisdictions: Vec<String>,
+    },
     /// Record that your county publishes no usable service of the dataset, with links that
     /// show it. This ends your job; use it only after a real search.
     #[command(
@@ -170,10 +179,31 @@ impl SpecTool {
                 )),
                 None => ToolOutput::error("no spec has been validated yet; run spec validate '<json>'"),
             },
-            Command::Submit => self.submit(agent, &job),
+            Command::Submit => self.submit(agent, &job).await,
+            Command::Left { jurisdictions } => {
+                if !matches!(job, Job::Jurisdictions(_)) {
+                    return ToolOutput::error("`spec left` is for a pass over a covered county's other jurisdictions");
+                }
+                // A list with commas names a jurisdiction between each; otherwise each word given is one.
+                let line = jurisdictions.join(" ");
+                let names: Vec<String> = if line.contains(',') {
+                    line.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_owned).collect()
+                } else {
+                    jurisdictions
+                };
+                self.work.with_agent(agent, |a| a.left = names);
+                ToolOutput::text("Noted: the next pass checks them. Reply now as your goal says.")
+            }
             Command::Unavailable { reason, evidence, note } => {
-                let Job::County(fips) = job else {
-                    return ToolOutput::error("a statewide search cannot mark counties unavailable");
+                let fips = match job {
+                    Job::County(fips) => fips,
+                    Job::Jurisdictions(_) => {
+                        return ToolOutput::error(
+                            "your county is covered, so it is not unavailable: a jurisdiction without a queryable \
+                             layer goes in your reply, one line each",
+                        );
+                    }
+                    Job::State(_) => return ToolOutput::error("a statewide search cannot mark counties unavailable"),
                 };
                 self.unavailable(agent, &fips, Reason::parse(&reason).expect("a listed reason"), evidence, note)
             }
@@ -225,11 +255,19 @@ impl SpecTool {
         ToolOutput::text(format!("{report}\n\n{next}"))
     }
 
-    fn submit(&self, agent: &str, job: &Job) -> ToolOutput {
-        let Some((last, model, rung)) = self.work.with_agent(agent, |a| (a.last.clone(), a.model.clone(), a.rung))
+    async fn submit(&self, agent: &str, job: &Job) -> ToolOutput {
+        let Some((last, model, rung, saved)) =
+            self.work.with_agent(agent, |a| (a.last.clone(), a.model.clone(), a.rung, a.saved.len()))
         else {
             return ToolOutput::error("this agent has no job");
         };
+        let pass = matches!(job, Job::Jurisdictions(_));
+        if pass && saved >= LAYERS_PER_PASS {
+            return ToolOutput::error(format!(
+                "this pass saved {saved} layers, the most one pass saves: `spec left` the jurisdictions you did not \
+                 get to, then reply"
+            ));
+        }
         let Some(last) = last else {
             return ToolOutput::error("no spec has been validated yet; run spec validate '<json>' first");
         };
@@ -254,8 +292,38 @@ impl SpecTool {
                 })
             })
             .unwrap_or_default();
+        // A layer saved already for one of these counties, under any id, is not saved again; nor
+        // is the whole of a layer part of which is saved, or a part of one saved whole.
+        let twin = {
+            let registry = self.work.registry.lock().unwrap();
+            passing
+                .iter()
+                .flat_map(|fips| registry.index.get(fips).into_iter().flatten())
+                .filter_map(|id| registry.adapters.get(id))
+                .find(|s| {
+                    s.id != last.spec.id
+                        && s.source == last.spec.source
+                        && (s.filter == last.spec.filter || s.filter.is_none() || last.spec.filter.is_none())
+                })
+                .map(|s| (s.id.clone(), s.filter == last.spec.filter))
+        };
+        match twin {
+            Some((id, true)) => {
+                return ToolOutput::error(format!(
+                    "that layer is saved already as {id}; submit another jurisdiction's layer, or reply"
+                ));
+            }
+            Some((id, false)) => {
+                return ToolOutput::error(format!(
+                    "part of that layer is saved already as {id}, or all of it: its features would show twice. \
+                     Submit only what {id} does not hold, with a filter, or another jurisdiction's layer"
+                ));
+            }
+            None => {}
+        }
         let at = now();
         let mut spec = last.spec;
+        spec.extent = self.work.runtime.extent(&spec).await;
         spec.verification.model = Some(model);
         spec.verification.rung = Some(rung);
         spec.verification.verified_at = at;
@@ -274,12 +342,26 @@ impl SpecTool {
                 Err(error) => return ToolOutput::error(format!("{error:#}")),
             }
         };
-        self.work.with_agent(agent, |a| {
-            a.resolution = Some(Resolution::Covered(saved.id.clone()));
-            a.saved += 1;
-        });
+        let count = self
+            .work
+            .with_agent(agent, |a| {
+                a.resolution = Some(Resolution::Covered(saved.id.clone()));
+                a.saved.push(saved.id.clone());
+                a.saved.len()
+            })
+            .unwrap_or_default();
         self.work.log(format!("{}: saved {} (verified for {})", job.label(), saved.id, passing.join(", ")));
-        ToolOutput::text(format!("Saved {}. {}", saved.id, self.work.dataset.agents.saved))
+        let next = match (pass, count >= LAYERS_PER_PASS) {
+            (true, true) => format!(
+                "That is {count}, the most one pass saves: `spec left` the jurisdictions you did not get to, which \
+                 the next pass starts from, then reply."
+            ),
+            (true, false) => "Go on with the next jurisdiction the saved layers leave out; when none is left, reply \
+                              as your goal says."
+                .to_owned(),
+            (false, _) => self.work.dataset.agents.saved.to_owned(),
+        };
+        ToolOutput::text(format!("Saved {}. {next}", saved.id))
     }
 
     fn unavailable(&self, agent: &str, fips: &str, reason: Reason, evidence: Vec<String>, note: String) -> ToolOutput {

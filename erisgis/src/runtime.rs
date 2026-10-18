@@ -109,6 +109,28 @@ impl Runtime {
         Ok(fetch)
     }
 
+    /// Where the spec's features lie, in longitude and latitude, as an ArcGIS source answers a
+    /// query for their extent; none for other sources, or an answer that is not one.
+    pub async fn extent(&self, spec: &Spec) -> Option<Bbox> {
+        let Source::ArcgisFeature { url, .. } = &spec.source else { return None };
+        let mut query = url::Url::parse(&format!("{}/query", url.trim_end_matches('/'))).ok()?;
+        query
+            .query_pairs_mut()
+            .append_pair("where", spec.filter.as_deref().unwrap_or("1=1"))
+            .append_pair("returnExtentOnly", "true")
+            .append_pair("outSR", "4326")
+            .append_pair("f", "json");
+        let body = self.arcgis_page(query.as_str()).await.ok()?;
+        let extent = &body["extent"];
+        let edge = |k: &str| extent[k].as_f64().filter(|v| v.is_finite());
+        let [west, south, east, north] = [edge("xmin")?, edge("ymin")?, edge("xmax")?, edge("ymax")?];
+        let degrees = (-180.0..=180.0).contains(&west)
+            && (-180.0..=180.0).contains(&east)
+            && (-90.0..=90.0).contains(&south)
+            && (-90.0..=90.0).contains(&north);
+        (degrees && west <= east && south <= north).then_some(Bbox([west, south, east, north]))
+    }
+
     /// One page of an ArcGIS query, asked again while the server timed out answering it.
     async fn arcgis_page(&self, url: &str) -> Result<Value> {
         let mut pauses = ARCGIS_RETRIES.iter();

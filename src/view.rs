@@ -85,6 +85,10 @@ impl View {
             .map(|a| AgentRow {
                 job: match &a.job {
                     Job::County(fips) => scheduler.work.counties.get(fips).map_or(fips.clone(), |c| c.label()),
+                    Job::Jurisdictions(fips) => format!(
+                        "{} (jurisdictions)",
+                        scheduler.work.counties.get(fips).map_or(fips.clone(), |c| c.label())
+                    ),
                     Job::State(state) => format!("statewide {state}"),
                 },
                 rung: a.rung,

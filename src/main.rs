@@ -79,6 +79,16 @@ enum Command {
         /// Try counties again that used up the ladder.
         #[arg(long)]
         retry_failed: bool,
+        /// Pass over the selected counties that are covered, for the jurisdictions their saved
+        /// layers leave out (cities' zoning beside the county's, say), instead of searching open
+        /// ones: one pass each, and another after a pass that saves as many layers as one may.
+        /// For a dataset taken per jurisdiction.
+        #[arg(long)]
+        jurisdictions: bool,
+        /// With --jurisdictions: pass over counties passed over before, too, each briefed with
+        /// what its last pass said.
+        #[arg(long, requires = "jurisdictions")]
+        again: bool,
         /// Print progress lines instead of drawing the terminal view.
         #[arg(long)]
         no_tui: bool,
@@ -269,12 +279,17 @@ async fn main() -> Result<()> {
             no_statewide,
             recheck,
             retry_failed,
+            jurisdictions,
+            again,
             no_tui,
         } => {
+            if jurisdictions && !dataset.per_jurisdiction {
+                bail!("--jurisdictions is for a dataset taken per jurisdiction, which {} is not", dataset.name);
+            }
             let all = Arc::new(Counties::embedded()?);
             let selected = select(&all, &states, &fips)?;
             // Naming counties alone skips the statewide search unless states are named too.
-            let statewide = !no_statewide && (fips.is_empty() || !states.is_empty());
+            let statewide = !no_statewide && !jurisdictions && (fips.is_empty() || !states.is_empty());
             let accounts = accounts(&cli.state)?;
             let listed = listed_models(&accounts).await;
             let ladder = match &ladder {
@@ -312,7 +327,8 @@ async fn main() -> Result<()> {
                 .await
                 .context("opening the agents' state")?;
             let (journal, past) = Journal::open(&run_state.join("journal.jsonl"))?;
-            let settings = Settings { concurrency, ladder, attempts_per_rung, statewide, retry_failed };
+            let settings =
+                Settings { concurrency, ladder, attempts_per_rung, statewide, retry_failed, jurisdictions, again };
             // Jobs start while every login the ladder runs on gives a token.
             let needs_codex = settings.ladder.iter().any(|r| r.provider == CODEX);
             let needs_claude = settings.ladder.iter().any(|r| r.provider == ANTHROPIC);

@@ -1,5 +1,6 @@
 //! What agents are told: the spec format and how to search, then each job's briefing with its
-//! county or state, what neighbouring counties' adapters use, and what earlier attempts tried.
+//! county or state, what neighbouring counties' adapters use, and what earlier attempts tried. A
+//! jurisdictions pass is told its county's saved layers and what the last pass left to check.
 
 use erisgis::Dataset;
 use erisgis::counties::{Counties, County};
@@ -32,6 +33,17 @@ pub fn system_prompt(dataset: &Dataset, state_job: bool) -> String {
     let goal = if state_job { dataset.agents.state_goal } else { dataset.agents.county_goal };
     format!(
         "{goal}\n\nHow to find {many}:\n{own}\n{how}",
+        many = dataset.many,
+        own = dataset.agents.how,
+        how = HOW.replace("{many}", dataset.many)
+    )
+}
+
+/// A jurisdictions pass's prompt: the dataset's goal for one, and how to search.
+pub fn jurisdictions_prompt(dataset: &Dataset) -> String {
+    format!(
+        "{goal}\n\nHow to find {many}:\n{own}\n{how}",
+        goal = dataset.agents.jurisdictions_goal.replace("{most}", &crate::work::LAYERS_PER_PASS.to_string()),
         many = dataset.many,
         own = dataset.agents.how,
         how = HOW.replace("{many}", dataset.many)
@@ -114,6 +126,58 @@ pub fn county_briefing(
             text.push_str(&format!("--- attempt {} ---\n{}\n", i + 1, summary.trim()));
         }
         text.push_str("Start from what they learned; do not repeat what failed.");
+    }
+    text
+}
+
+/// A covered county's briefing for a jurisdictions pass: its saved layers, what each holds, and
+/// what the last pass said it left.
+pub fn jurisdictions_briefing(
+    dataset: &Dataset,
+    county: &County,
+    counties: &Counties,
+    registry: &Registry,
+    last_pass: Option<&str>,
+    summaries: &[String],
+) -> String {
+    let b = county.bbox;
+    let mut text = format!(
+        "Your county: {} ({}), FIPS {}.\nBounding box (lon/lat): west {:.4}, south {:.4}, east {:.4}, north {:.4}.\n\n\
+         Its saved layers of {}:",
+        county.name,
+        county.state_name,
+        county.fips,
+        b.west(),
+        b.south(),
+        b.east(),
+        b.north(),
+        dataset.many,
+    );
+    for spec in registry.index.get(&county.fips).into_iter().flatten().filter_map(|id| registry.adapters.get(id)) {
+        let holds = if spec.fields.contains_key("jurisdiction") {
+            format!(" Holds several jurisdictions, named in its {} attribute.", spec.fields["jurisdiction"])
+        } else {
+            String::new()
+        };
+        let notes = if spec.notes.is_empty() { String::new() } else { format!(" Notes: {}", spec.notes) };
+        text.push_str(&format!("\n- {}.{holds}{notes}", source_line(spec)));
+    }
+    let neighbours = neighbour_adapters(registry, counties, county);
+    if !neighbours.is_empty() {
+        text.push_str("\n\nNeighbouring counties' adapters (their hosts may serve your jurisdictions too):\n");
+        text.push_str(&neighbours.join("\n"));
+    }
+    if let Some(report) = last_pass {
+        text.push_str(&format!(
+            "\n\nThe last pass reported:\n{}\nGo on from there: do not check again what it found unpublished.",
+            report.trim()
+        ));
+    }
+    if !summaries.is_empty() {
+        text.push_str("\n\nEarlier attempts at this pass, which did not finish, reported:\n");
+        for (i, summary) in summaries.iter().enumerate() {
+            text.push_str(&format!("--- attempt {} ---\n{}\n", i + 1, summary.trim()));
+        }
     }
     text
 }

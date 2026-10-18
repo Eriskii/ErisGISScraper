@@ -64,6 +64,7 @@ A spec:
   "coverage": { "counties": ["13121"] },
   "fields": { "apn": "ParcelID", "owner": "Owner", "address": "Address", "acres": "LandAcres", "land_use": "LUCode" },
   "notes": "Fulton County open data",
+  "extent": [-84.85, 33.50, -84.10, 34.19],
   "verification": { "verified_at": 1792041362000, "counties": ["13121"], "model": "…", "rung": 0 }
 }
 ```
@@ -82,6 +83,12 @@ queryable, and `spec submit` refuses a spec that does not say. Specs written bef
 existed read as unknown. `notes` lists the unofficial adapters. `coverage` is a list of county
 FIPS codes or a list of states. `fields` maps the dataset's normalized fields, each optional, to
 the source's attribute names; `filter` is an optional static filter (an ArcGIS `where` clause).
+`extent` is where the layer's features lie, `[west, south, east, north]` in degrees, as an ArcGIS
+source answers when the spec is saved or passes a check; a map box it misses is not read from
+it, so a county read through many cities' layers asks each only about its own ground. `spec
+submit` refuses a layer saved already for the county under another id, and the whole of a layer
+part of which is saved (or a part of one saved whole), whose features would show twice. An
+error naming an HTML answer (a block page, a login) names it by its title.
 Unavailable reasons are `no-public-gis`, `viewer-only`, `paywalled`, `login-required`,
 `tos-forbids-automation`, and for zoning `none-exists` (a county that does not zone, with no
 city in it that does); a record is searched again after 180 days, or 365 for `paywalled` and
@@ -179,6 +186,21 @@ resumes on the next start: running agents go on where they stood, finished attem
 repeated, and each county keeps its rung. `--recheck` validates every saved adapter first; a
 county whose adapter fails is searched again with the dead spec in its briefing.
 
+**Jurisdictions.** In zoning, which is taken per jurisdiction, `run --jurisdictions` passes over
+the selected counties that are covered, instead of searching open ones, for the jurisdictions
+their saved layers leave out: a city's zoning beside the county's, say, or a county's
+unincorporated land beside its largest city. The agent is told the county's saved layers (what
+each holds, and its notes), lists the county's jurisdictions, and submits a spec for each that
+publishes its zoning, largest first, at most 8 in a pass. Small townships and villages are
+checked all at once, by a search of the county's zoning and a look at its GIS and regional
+planning commission; cities and large townships one by one. `spec left` names those likely to
+publish a layer that it did not get to (as a list with commas), and its reply names each
+jurisdiction it checked without finding a queryable layer, and why. A pass that saves 8 or names
+jurisdictions left is followed by another, briefed with its report, up to 5 such passes in a row;
+the journal keeps the count, so a restarted run makes no more. The journal records each pass as a `jurisdictions` job,
+so a county is passed over once; `--again` passes over those done before too, each briefed with
+what its last pass said. A pass whose turn fails climbs the ladder as any job does.
+
 ## Using it
 
 ```sh
@@ -193,6 +215,8 @@ eris-gis-scraper run --counties 13121 --no-tui --ladder gpt-5-codex-mini:medium,
 eris-gis-scraper run --states WI --ladder haiku:medium,sonnet:high,opus:max
 eris-gis-scraper run --recheck
 eris-gis-scraper --dataset zoning run --ladder haiku:medium,sonnet:high --concurrency 64
+eris-gis-scraper --dataset zoning run --jurisdictions --states MI   # covered counties' other jurisdictions
+eris-gis-scraper --dataset zoning run --jurisdictions --again --counties 26163
 eris-gis-scraper validate spec.json 13121
 eris-gis-scraper --dataset zoning validate spec.json 13121
 eris-gis-scraper status                # the registry by state; --dataset zoning for zoning's
@@ -239,7 +263,12 @@ ignored offsets, refusals, missing fields), zoning on a fake zoning layer (valid
 district classes, each dataset's spec help and reasons), and whole runs against a stand-in
 model: an agent that gives up and hands over to the next rung, a statewide layer covering its
 counties without county agents, a county marked unavailable, a run stopped mid-turn that
-resumes its agent, and a zoning agent asked once about the jurisdictions its layer left out.
+resumes its agent, a zoning agent asked once about the jurisdictions its layer left out, a
+jurisdictions pass over a covered county (its briefing, a saved layer refused a second time, the
+city's layer saved with its extent, and no second pass once done), and a pass that saves as many
+layers as one may, or names jurisdictions left to check, followed by another briefed with its
+report, up to the limit, which a restarted run keeps, and a county passed over again on request. The lookup tests cover a box a
+layer's extent misses, which is not read from it.
 `ERISGISSCRAPER_LIVE_STATE=<state dir> cargo test --test live -- --ignored --nocapture` runs a
 real search and page read on each login in that state directory: the bound Claude login, and the
 ChatGPT login alone.

@@ -64,6 +64,20 @@ pub const ZONING: Dataset = Dataset {
             zone its unincorporated land, and does the county's largest city publish its own zoning layer? Find, \
             validate and submit those the layer you saved does not hold. If there are none, reply with one line \
             saying why.",
+        jurisdictions_goal: "You complete one US county's zoning. Its saved layers, listed in your briefing, leave out \
+            some of the jurisdictions in the county that zone their own land: its cities, towns, villages, boroughs \
+            and townships, and the county's own unincorporated land. Find the county's jurisdictions (a web search \
+            for its municipalities), and check which the saved layers hold: a layer with a jurisdiction field can \
+            hold several, and its notes say what it covers. For each jurisdiction they leave out, largest first, \
+            find whether it publishes its zoning districts as a queryable layer, and write, validate and submit a \
+            spec for each that does, with its own id (such as mi-wayne-dearborn) and coverage {\"counties\": \
+            [\"<your county's FIPS>\"]}, at most {most} in this pass. Never submit a layer that is saved already. \
+            Small townships and villages rarely publish GIS of their own: one `arcgis search` of the county's \
+            zoning, and a look at the county's GIS and its regional planning commission's, checks them all at \
+            once, so search one by one only the cities and large townships with a GIS site or a planning \
+            department. Before you reply, `spec left` the jurisdictions likely to publish a layer that you did not \
+            get to check, if any: the next pass starts from them. Your job ends when you reply: what you saved, and one line for each jurisdiction you checked \
+            without finding a queryable layer, saying why, so no pass checks it again.",
     },
 };
 
@@ -117,7 +131,7 @@ const NAME_WORDS: [(&str, &str); 31] = [
 ];
 
 /// District code prefixes, and the class each means, longest first.
-const CODE_PREFIXES: [(&str, &str); 26] = [
+const CODE_PREFIXES: [(&str, &str); 30] = [
     ("PUD", "planned"),
     ("CBD", "commercial"),
     ("MXD", "mixed-use"),
@@ -133,6 +147,10 @@ const CODE_PREFIXES: [(&str, &str); 26] = [
     ("HI", "industrial"),
     ("GI", "industrial"),
     ("PF", "public"),
+    // Neighbourhood districts: mixed centres, shops, and the neighbourhoods themselves.
+    ("NM", "mixed-use"),
+    ("NC", "commercial"),
+    ("NB", "commercial"),
     // Downtown districts: residential ones, and the rest, which mix uses.
     ("DR", "residential"),
     ("D", "mixed-use"),
@@ -144,6 +162,7 @@ const CODE_PREFIXES: [(&str, &str); 26] = [
     ("M", "industrial"),
     ("O", "office"),
     ("P", "public"),
+    ("N", "residential"),
     ("U", "other"),
 ];
 
@@ -247,6 +266,13 @@ mod tests {
             (Some("TMU"), None, "mixed-use"),
             (Some("RC-4"), Some("Residential- Commercial, High Density"), "mixed-use"),
             (Some("UOR"), Some("Urban Office Residential"), "mixed-use"),
+            // Neighbourhood codes, as form-based ordinances name them: neighbourhoods, their
+            // mixed centres, and their shops.
+            (Some("N1"), Some("R-1"), "residential"),
+            (Some("N2"), None, "residential"),
+            (Some("NM1"), Some("R-7"), "mixed-use"),
+            (Some("NC"), None, "commercial"),
+            (Some("NB-2"), None, "commercial"),
         ];
         for (zone, name, expected) in cases {
             assert_eq!(class(zone, name), expected, "{zone:?} {name:?}");

@@ -196,3 +196,48 @@ async fn the_map_gets_repaired_outlines() {
         assert!(geometry.is_valid(), "{}", feature["properties"]["key"]);
     }
 }
+
+#[tokio::test]
+async fn a_layer_says_where_it_lies_and_a_box_it_misses_does_not_read_it() {
+    let counties = Counties::embedded().unwrap();
+    let [x, y] = counties.get("55025").unwrap().interior;
+    let root = support::serve(support::Grid::around(x, y)).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    // The layer's extent, in longitude and latitude: the grid's.
+    let spec: erisgis::spec::Spec = serde_json::from_value(json!({
+        "version": 1, "id": "wi-dane", "publisher": "Dane County Land Information",
+        "source": {"kind": "arcgis-feature", "url": format!("{root}/arcgis/good/FeatureServer/0")},
+        "coverage": {"counties": ["55025"]}, "fields": {"apn": "PARCELNO"},
+    }))
+    .unwrap();
+    let extent = runtime(dir.path()).extent(&spec).await.expect("an ArcGIS layer has an extent");
+    let half = support::CELL * support::SIDE as f64 / 2.0;
+    for (got, want) in extent.0.iter().zip([x - half, y - half, x + half, y + half]) {
+        assert!((got - want).abs() < 0.001, "{extent:?}");
+    }
+
+    // A layer that refuses every query, lying elsewhere, is not asked about a box it misses;
+    // one lying over the box is, and says it failed.
+    let bbox = dane_box(&counties);
+    let read_with = |extent: [f64; 4], name: &str| {
+        let registry = dir.path().join(name);
+        write(
+            &registry.join("adapters/wi-dane.json"),
+            &json!({"version": 1, "id": "wi-dane", "publisher": "Dane County Land Information",
+                    "coverage": {"counties": ["55025"]}, "extent": extent,
+                    "source": {"kind": "arcgis-feature", "url": format!("{root}/arcgis/refuses/FeatureServer/0")},
+                    "fields": {"apn": "PARCELNO"}}),
+        );
+        write(&registry.join("index.json"), &json!({"version": 1, "counties": {"55025": ["wi-dane"]}}));
+        let cache = dir.path().join(format!("{name}-cache"));
+        async move { read(&registry, &cache, bbox).await }
+    };
+    let elsewhere = read_with([x + 0.2, y + 0.2, x + 0.3, y + 0.3], "elsewhere").await;
+    let source = &elsewhere.counties[0].sources[0];
+    assert_eq!((source.adapter.as_str(), &source.error, source.here), ("wi-dane", &None, false), "listed, not read");
+    assert!(elsewhere.features.is_empty());
+    let over = read_with([x - 0.1, y - 0.1, x + 0.1, y + 0.1], "over").await;
+    assert!(over.counties[0].sources[0].here);
+    assert!(over.counties[0].sources[0].error.as_deref().unwrap_or_default().contains("refused"));
+}

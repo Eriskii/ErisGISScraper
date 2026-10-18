@@ -9,11 +9,11 @@ use erisgis::counties::Counties;
 use erisgis::http::{Http, Limits};
 use erisgis::registry::Registry;
 use erisgis::runtime::{Runtime, VALIDATE_WITHIN};
-use erisgisscraper::journal::{Event, Journal, Outcome};
+use erisgisscraper::journal::{Event, Job, Journal, Outcome};
 use erisgisscraper::models::{self, CODEX, Providers, Rung};
 use erisgisscraper::scheduler::{Scheduler, Settings};
 use erisgisscraper::tools;
-use erisgisscraper::work::Work;
+use erisgisscraper::work::{LAYERS_PER_PASS, PASSES_IN_A_ROW, Work};
 use erisharness::Harness;
 use erisharness::provider::{Provider, RateGate, Responses, ResponsesConfig, StaticToken};
 use erisharness::tools::web::Models;
@@ -90,7 +90,15 @@ async fn scheduler_on(
     }
     let harness = builder.open().await.unwrap();
     let (journal, past) = Journal::open(&dir.join("journal.jsonl")).unwrap();
-    let settings = Settings { concurrency: 4, ladder, attempts_per_rung: 1, statewide, retry_failed: false };
+    let settings = Settings {
+        concurrency: 4,
+        ladder,
+        attempts_per_rung: 1,
+        statewide,
+        retry_failed: false,
+        jurisdictions: false,
+        again: false,
+    };
     Scheduler::new(work, harness, journal, past, settings, counties, empty, Box::new(|| Box::pin(async { true })))
 }
 
@@ -455,12 +463,8 @@ async fn a_failed_statewide_check_is_not_repeated_after_a_restart() {
 async fn a_zoning_agent_that_saved_one_layer_is_asked_once_about_the_rest_of_the_county() {
     let dir = tempfile::tempdir().unwrap();
     let root = support::serve(support::Grid::around_all(&interiors(&["55025"]))).await;
-    let layer = |id: &str| {
-        json!({"id": id, "publisher": "Dane County", "official": true,
-               "source": {"kind": "arcgis-feature", "url": format!("{root}/zoning/FeatureServer/0"), "page_size": 4},
-               "coverage": {"counties": ["55025"]}, "fields": {"zone": "ZONING", "zone_name": "ZONE_DESC"}})
-    };
-    let (county, city) = (layer("wi-dane"), layer("wi-madison"));
+    let county = dane_zoning(&root, "wi-dane", "Dane County", "dane");
+    let city = dane_zoning(&root, "wi-madison", "City of Madison", "madison");
     let brain: Brain = Arc::new(move |request: &Request| {
         let asked_again = request.user.len() > 1;
         let last = request.last_output();
@@ -484,4 +488,178 @@ async fn a_zoning_agent_that_saved_one_layer_is_asked_once_about_the_rest_of_the
     let asked: Vec<&String> = requests.iter().filter_map(|r| r.user.get(1)).collect();
     assert!(asked.iter().all(|m| m.contains("largest city")), "{asked:?}");
     assert_eq!(requests.last().unwrap().user.len(), 2, "asked once, not again after the second layer");
+}
+
+/// The fake server's zoning `layer` in Dane County, as `publisher`'s, saved as `id`.
+fn dane_zoning(root: &str, id: &str, publisher: &str, layer: &str) -> Value {
+    json!({"id": id, "publisher": publisher, "official": true,
+        "source": {"kind": "arcgis-feature", "url": format!("{root}/zoning/{layer}/FeatureServer/0"), "page_size": 4},
+        "coverage": {"counties": ["55025"]}, "fields": {"zone": "ZONING", "zone_name": "ZONE_DESC"}})
+}
+
+/// Saves `spec` as verified for Dane County, as an earlier run left it.
+fn saved_for_dane(dir: &Path, spec: &Value) {
+    let mut spec = spec.clone();
+    spec["version"] = json!(1);
+    let mut registry = Registry::open(&dir.join("registry")).unwrap();
+    let saved = registry.save_adapter(serde_json::from_value(spec).unwrap()).unwrap();
+    registry.verified(&saved.id, "55025", 1).unwrap();
+}
+
+fn jurisdiction_passes(dir: &Path) -> Vec<Outcome> {
+    events(dir)
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Finished { job: Job::Jurisdictions(fips), outcome, .. } if fips == "55025" => Some(outcome),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_covered_zoning_county_is_searched_again_for_the_jurisdictions_its_layers_leave_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = support::serve(support::Grid::around_all(&interiors(&["55025"]))).await;
+    saved_for_dane(dir.path(), &dane_zoning(&root, "wi-dane", "Dane County", "dane"));
+    // The agent first offers the county's own layer again under a new id, then Madison's.
+    let again = dane_zoning(&root, "wi-dane-zoning", "Dane County", "dane");
+    let madison = dane_zoning(&root, "wi-madison", "City of Madison", "madison");
+    let brain: Brain = Arc::new(move |request: &Request| {
+        let command = |line: String| Reply::Calls("spec".into(), json!({"command": line}));
+        let validate = |spec: &Value| command(format!("validate {}", quoted(&spec.to_string())));
+        let last = request.last_output();
+        let refused = request.outputs.iter().any(|o| o.contains("saved already as wi-dane"));
+        if last.contains("Saved wi-madison") {
+            Reply::Says("Saved wi-madison. Sun Prairie publishes its zoning only as PDF maps.".into())
+        } else if last.contains("\"passed\": true") {
+            command("submit".into())
+        } else if refused {
+            validate(&madison)
+        } else {
+            validate(&again)
+        }
+    });
+    let model = Model::start(brain).await;
+    let run = scheduler_for(dir.path(), &model, vec!["55025".into()], false, &erisgis::zoning::ZONING).await;
+    run.settings.lock().unwrap().jurisdictions = true;
+    tokio::time::timeout(Duration::from_secs(60), run.run()).await.unwrap().unwrap();
+    drop(run);
+
+    let registry = Registry::open(&dir.path().join("registry")).unwrap();
+    assert_eq!(registry.index["55025"], ["wi-dane", "wi-madison"]);
+    let extent = registry.adapters["wi-madison"].extent.expect("a saved layer says where it lies");
+    let [x, y] = Counties::embedded().unwrap().get("55025").unwrap().interior;
+    assert!(extent.contains(x, y), "{extent:?}");
+
+    let requests = model.requests.lock().unwrap().clone();
+    let first = &requests[0];
+    assert!(first.instructions.contains("leave out"), "{}", first.instructions);
+    assert!(first.briefing().contains("Dane County") && first.briefing().contains("wi-dane"), "{}", first.briefing());
+    assert!(
+        requests.iter().all(|r| !r.outputs.iter().any(|o| o.contains("Saved wi-dane-zoning"))),
+        "a layer saved already is not saved twice"
+    );
+    let passes = jurisdiction_passes(dir.path());
+    let [Outcome::Done { detail, more: false }] = passes.as_slice() else { panic!("one pass, done: {passes:?}") };
+    assert!(detail.contains("wi-madison") && detail.contains("Sun Prairie"), "{detail}");
+
+    // Done once: neither another jurisdictions run nor an ordinary one starts an agent.
+    for jurisdictions in [true, false] {
+        let run = scheduler_for(dir.path(), &model, vec!["55025".into()], false, &erisgis::zoning::ZONING).await;
+        run.settings.lock().unwrap().jurisdictions = jurisdictions;
+        tokio::time::timeout(Duration::from_secs(30), run.run()).await.unwrap().unwrap();
+    }
+    assert_eq!(model.requests.lock().unwrap().len(), requests.len());
+
+    // Passed over again on request, the county's agent starts from what the last pass said.
+    let run = scheduler_for(dir.path(), &model, vec!["55025".into()], false, &erisgis::zoning::ZONING).await;
+    {
+        let mut settings = run.settings.lock().unwrap();
+        settings.jurisdictions = true;
+        settings.again = true;
+    }
+    tokio::time::timeout(Duration::from_secs(30), run.run()).await.unwrap().unwrap();
+    let requests = model.requests.lock().unwrap();
+    let again = requests.last().unwrap();
+    assert!(again.briefing().contains("The last pass reported") && again.briefing().contains("Sun Prairie"));
+    assert!(again.briefing().contains("wi-madison"), "{}", again.briefing());
+    assert_eq!(jurisdiction_passes(dir.path()).len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_that_names_jurisdictions_left_to_check_is_followed_by_another_up_to_a_limit_restarts_keep() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = support::serve(support::Grid::around_all(&interiors(&["55025"]))).await;
+    saved_for_dane(dir.path(), &dane_zoning(&root, "wi-dane", "Dane County", "dane"));
+    // Every pass runs out of room before Sun Prairie, and says so, as a list with commas.
+    let brain: Brain = Arc::new(|request: &Request| {
+        if request.outputs.is_empty() {
+            Reply::Calls("spec".into(), json!({"command": "left Sun Prairie, Fitchburg"}))
+        } else {
+            Reply::Says("Sun Prairie and Fitchburg are left to check.".into())
+        }
+    });
+    let model = Model::start(brain).await;
+    let run = scheduler_for(dir.path(), &model, vec!["55025".into()], false, &erisgis::zoning::ZONING).await;
+    run.settings.lock().unwrap().jurisdictions = true;
+    tokio::time::timeout(Duration::from_secs(90), run.run()).await.unwrap().unwrap();
+
+    drop(run);
+    let passes = jurisdiction_passes(dir.path());
+    assert_eq!(passes.len(), PASSES_IN_A_ROW, "{passes:?}");
+    let Outcome::Done { detail, more: true } = &passes[0] else { panic!("{passes:?}") };
+    assert!(detail.contains("Left to check: Sun Prairie, Fitchburg."), "{detail}");
+    let asked = model.requests.lock().unwrap().len();
+    assert!(
+        model.requests.lock().unwrap().iter().any(|r| r.briefing().contains("Left to check: Sun Prairie, Fitchburg"))
+    );
+
+    // A restarted run keeps the count: no sixth pass.
+    let run = scheduler_for(dir.path(), &model, vec!["55025".into()], false, &erisgis::zoning::ZONING).await;
+    run.settings.lock().unwrap().jurisdictions = true;
+    tokio::time::timeout(Duration::from_secs(30), run.run()).await.unwrap().unwrap();
+    assert_eq!(model.requests.lock().unwrap().len(), asked);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pass_that_saves_as_many_layers_as_a_pass_may_is_followed_by_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = support::serve(support::Grid::around_all(&interiors(&["55025"]))).await;
+    saved_for_dane(dir.path(), &dane_zoning(&root, "wi-dane", "Dane County", "dane"));
+    let towns: Vec<Value> = (1..=LAYERS_PER_PASS)
+        .map(|n| dane_zoning(&root, &format!("wi-town-{n}"), &format!("Town {n}"), &format!("town-{n}")))
+        .collect();
+    let brain: Brain = Arc::new(move |request: &Request| {
+        if request.briefing().contains("The last pass") {
+            return Reply::Says("No jurisdiction is left.".into());
+        }
+        let command = |line: String| Reply::Calls("spec".into(), json!({"command": line}));
+        let saved = request.outputs.iter().filter(|o| o.starts_with("Saved ")).count();
+        let last = request.last_output();
+        if last.starts_with("Noted") {
+            Reply::Says("Saved eight towns; Town 9 and Town 10 are left to check.".into())
+        } else if last.contains("the most one pass saves") {
+            command("left \"Town 9\" \"Town 10\"".into())
+        } else if last.contains("\"passed\": true") {
+            command("submit".into())
+        } else {
+            command(format!("validate {}", quoted(&towns[saved].to_string())))
+        }
+    });
+    let model = Model::start(brain).await;
+    let run = scheduler_for(dir.path(), &model, vec!["55025".into()], false, &erisgis::zoning::ZONING).await;
+    run.settings.lock().unwrap().jurisdictions = true;
+    tokio::time::timeout(Duration::from_secs(90), run.run()).await.unwrap().unwrap();
+
+    let registry = Registry::open(&dir.path().join("registry")).unwrap();
+    assert_eq!(registry.index["55025"].len(), 1 + LAYERS_PER_PASS);
+    let passes = jurisdiction_passes(dir.path());
+    assert!(
+        matches!(passes.as_slice(), [Outcome::Done { more: true, .. }, Outcome::Done { more: false, .. }]),
+        "{passes:?}"
+    );
+    let requests = model.requests.lock().unwrap();
+    let second = requests.iter().find(|r| r.briefing().contains("The last pass")).unwrap();
+    assert!(second.briefing().contains("Left to check: Town 9, Town 10"), "{}", second.briefing());
+    assert!(second.briefing().contains("wi-town-8"), "the saved layers include the last pass's");
 }

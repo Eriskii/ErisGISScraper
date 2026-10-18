@@ -11,6 +11,13 @@ use erisgis::validate::{self, Report};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+/// The most layers one jurisdictions pass saves; a pass that saves this many, or names
+/// jurisdictions it left unchecked, is followed by another.
+pub const LAYERS_PER_PASS: usize = 8;
+/// The most jurisdictions passes over a county in a row, each asking for another; the journal
+/// keeps the count, so a restarted run makes no more.
+pub const PASSES_IN_A_ROW: usize = 5;
+
 /// How an agent's job ended, as its tools recorded it.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Resolution {
@@ -47,10 +54,12 @@ pub struct AgentJob {
     pub started: u64,
     /// Whether the agent has been told to keep going once already.
     pub nudged: bool,
-    /// Specs it saved.
-    pub saved: usize,
+    /// The ids of the specs it saved.
+    pub saved: Vec<String>,
     /// Whether it has been asked about the jurisdictions its saved layer leaves out.
     pub followed_up: bool,
+    /// In a jurisdictions pass, the jurisdictions it names as left to check.
+    pub left: Vec<String>,
 }
 
 impl AgentJob {
@@ -68,8 +77,9 @@ impl AgentJob {
             trail: VecDeque::new(),
             started: erisgis::registry::now(),
             nudged: false,
-            saved: 0,
+            saved: Vec::new(),
             followed_up: false,
+            left: Vec::new(),
         }
     }
 
@@ -124,7 +134,7 @@ impl Work {
     /// spread across it.
     pub fn sample_counties(&self, job: &Job) -> Vec<County> {
         match job {
-            Job::County(fips) => self.counties.get(fips).into_iter().cloned().collect(),
+            Job::County(fips) | Job::Jurisdictions(fips) => self.counties.get(fips).into_iter().cloned().collect(),
             Job::State(state) => self.counties.spread(state, 3).into_iter().cloned().collect(),
         }
     }
@@ -139,7 +149,7 @@ impl Work {
         .await;
         let passed = reports.iter().filter(|r| r.passed).count();
         let ok = match job {
-            Job::County(_) => passed == 1,
+            Job::County(_) | Job::Jurisdictions(_) => passed == 1,
             Job::State(_) => passed >= counties.len().min(2),
         };
         (ok, reports)

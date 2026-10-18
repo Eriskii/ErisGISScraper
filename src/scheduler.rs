@@ -3,6 +3,11 @@
 //! adapter already claiming it. A county climbs the model ladder: it starts on the cheapest
 //! rung, and an attempt that gives up or fails hands a summary of what it tried to the next.
 //!
+//! A jurisdictions run, in a dataset taken per jurisdiction, instead passes over the covered
+//! counties for the jurisdictions their saved layers leave out: one pass each, and another
+//! after a pass that saved as many layers as one may or named jurisdictions left to check, up to
+//! [`PASSES_IN_A_ROW`].
+//!
 //! Every attempt is journaled as it starts and ends, and the harness keeps its agents, so a
 //! killed run picks its agents up again and goes on.
 
@@ -10,7 +15,7 @@ use crate::journal::{Event, Job, JobHistory, Journal, Outcome, Tokens, replay};
 use crate::models::Rung;
 use crate::prompts;
 use crate::tools;
-use crate::work::{AgentJob, Resolution, Work};
+use crate::work::{AgentJob, LAYERS_PER_PASS, PASSES_IN_A_ROW, Resolution, Work};
 use anyhow::Result;
 use erisgis::registry::{Standing, now};
 use erisgis::spec::Spec;
@@ -37,6 +42,11 @@ pub struct Settings {
     pub statewide: bool,
     /// Whether counties that used up the ladder are tried again.
     pub retry_failed: bool,
+    /// Whether the run passes over covered counties for the jurisdictions their saved layers
+    /// leave out, instead of searching open ones.
+    pub jurisdictions: bool,
+    /// In a jurisdictions run, whether counties passed over before are passed over again.
+    pub again: bool,
 }
 
 /// Attempts and tokens on one rung of the ladder.
@@ -234,9 +244,11 @@ impl Scheduler {
     }
 
     pub fn status(&self, fips: &str) -> Status {
-        if self.running.lock().unwrap().contains(&Job::County(fips.to_owned())) {
+        let running = self.running.lock().unwrap();
+        if running.contains(&Job::County(fips.to_owned())) || running.contains(&Job::Jurisdictions(fips.to_owned())) {
             return Status::Running;
         }
+        drop(running);
         match self.work.registry.lock().unwrap().standing(fips, now()) {
             Standing::Covered(_) => return Status::Covered,
             Standing::Unavailable(_) => return Status::Unavailable,
@@ -249,10 +261,24 @@ impl Scheduler {
         matches!(self.work.registry.lock().unwrap().standing(fips, now()), Standing::Open)
     }
 
-    /// The next job ready to start: states first, then counties whose state has settled.
+    /// The next job ready to start: states first, then counties whose state has settled; in a
+    /// jurisdictions run, the next covered county due a pass.
     fn next_job(&self) -> Option<Job> {
         let settings = self.settings.lock().unwrap().clone();
         let running = self.running.lock().unwrap().clone();
+        if settings.jurisdictions {
+            return self.counties.iter().map(|fips| Job::Jurisdictions(fips.clone())).find(|job| {
+                let Job::Jurisdictions(fips) = job else { return false };
+                let covered = matches!(self.work.registry.lock().unwrap().standing(fips, now()), Standing::Covered(_));
+                let (finished, streak) =
+                    self.jobs.lock().unwrap().get(job).map_or((None, 0), |h| (h.finished.clone(), h.streak));
+                covered
+                    && !running.contains(job)
+                    && !matches!(finished, Some(Outcome::Done { more: false, .. }))
+                    && streak < PASSES_IN_A_ROW
+                    && !self.exhausted(job)
+            });
+        }
         if settings.statewide {
             for state in &self.states {
                 let job = Job::State(state.clone());
@@ -294,6 +320,15 @@ impl Scheduler {
 
     /// Runs until every selected job is settled, or until told to stop.
     pub async fn run(self: &Arc<Self>) -> Result<()> {
+        if self.settings.lock().unwrap().again {
+            // Passing over again: each finished pass's report briefs the next.
+            for (job, history) in self.jobs.lock().unwrap().iter_mut() {
+                if let (Job::Jurisdictions(_), Some(Outcome::Done { more, .. })) = (job, &mut history.finished) {
+                    *more = true;
+                    history.streak = 0;
+                }
+            }
+        }
         if self.settings.lock().unwrap().retry_failed {
             // Retrying starts used-up counties from the bottom of the ladder again.
             for history in self.jobs.lock().unwrap().values_mut() {
@@ -309,9 +344,12 @@ impl Scheduler {
             if self.stopping.load(Ordering::SeqCst) {
                 break;
             }
+            let jurisdictions = self.settings.lock().unwrap().jurisdictions;
             if !self.paused.load(Ordering::SeqCst) {
                 let statewide = self.settings.lock().unwrap().statewide;
-                self.start_checks(statewide);
+                if !jurisdictions {
+                    self.start_checks(statewide);
+                }
                 let concurrency = self.settings.lock().unwrap().concurrency;
                 while self.running_jobs() < concurrency {
                     let Some(job) = self.next_job() else { break };
@@ -337,7 +375,7 @@ impl Scheduler {
                 && self.checks_running() == 0
                 && !self.paused.load(Ordering::SeqCst)
                 && self.next_job().is_none()
-                && self.checks_due(self.settings.lock().unwrap().statewide).is_empty()
+                && (jurisdictions || self.checks_due(self.settings.lock().unwrap().statewide).is_empty())
             {
                 self.work.log("every selected job is settled");
                 break;
@@ -406,7 +444,7 @@ impl Scheduler {
 
     async fn run_job(self: Arc<Self>, job: &Job) -> Result<()> {
         match job {
-            Job::County(_) | Job::State(_) => self.attempt(job).await,
+            Job::County(_) | Job::State(_) | Job::Jurisdictions(_) => self.attempt(job).await,
         }
     }
 
@@ -429,12 +467,25 @@ impl Scheduler {
             });
             if report.passed {
                 let _ = self.work.registry.lock().unwrap().verified(&spec.id, fips, now());
+                self.note_extent(&spec).await;
                 self.work.log(format!("county {fips}: covered by {}", spec.id));
                 return true;
             }
             self.refused.lock().unwrap().insert(key);
         }
         false
+    }
+
+    /// Records where a saved adapter's layer lies, when it does not say yet and its source does.
+    async fn note_extent(&self, spec: &Spec) {
+        if spec.extent.is_some() {
+            return;
+        }
+        let Some(extent) = self.work.runtime.extent(spec).await else { return };
+        let mut registry = self.work.registry.lock().unwrap();
+        if let Some(saved) = registry.adapters.get(&spec.id).cloned() {
+            let _ = registry.save_adapter(Spec { extent: Some(extent), ..saved });
+        }
     }
 
     /// One attempt at a job on its next rung, start to end.
@@ -460,6 +511,25 @@ impl Scheduler {
                 };
                 (prompts::system_prompt(self.work.dataset, false), briefing)
             }
+            Job::Jurisdictions(fips) => {
+                let county = self.work.counties.get(fips).ok_or_else(|| anyhow::anyhow!("no county {fips}"))?;
+                let last_pass = match &history.finished {
+                    Some(Outcome::Done { detail, more: true }) => Some(detail.as_str()),
+                    _ => None,
+                };
+                let briefing = {
+                    let registry = self.work.registry.lock().unwrap();
+                    prompts::jurisdictions_briefing(
+                        self.work.dataset,
+                        county,
+                        &self.work.counties,
+                        &registry,
+                        last_pass,
+                        &history.summaries,
+                    )
+                };
+                (prompts::jurisdictions_prompt(self.work.dataset), briefing)
+            }
             Job::State(state) => {
                 let count = self.work.counties.in_state(state).count();
                 let name = self.work.counties.in_state(state).next().map(|c| c.state_name.clone()).unwrap_or_default();
@@ -470,7 +540,7 @@ impl Scheduler {
             }
         };
         let tools: Vec<String> = match job {
-            Job::County(_) => tools::COUNTY_TOOLS.iter().map(|s| s.to_string()).collect(),
+            Job::County(_) | Job::Jurisdictions(_) => tools::COUNTY_TOOLS.iter().map(|s| s.to_string()).collect(),
             Job::State(_) => tools::STATE_TOOLS.iter().map(|s| s.to_string()).collect(),
         };
         let agent = self.harness.create_agent(AgentSpec {
@@ -520,6 +590,16 @@ impl Scheduler {
                 return Ok(());
             }
             let record = self.harness.agent(agent)?;
+            let last = last_text(&self.harness, agent);
+            if let Job::Jurisdictions(_) = job {
+                let outcome = self.pass_outcome(agent, &record, last);
+                let tokens = Tokens {
+                    input: record.usage.input,
+                    cached_input: record.usage.cached_input,
+                    output: record.usage.output,
+                };
+                return self.finish(job, rung, agent, outcome, tokens);
+            }
             let resolution = self.work.with_agent(agent, |a| a.resolution.clone()).flatten().or_else(|| match job {
                 // A resumed agent may have saved its result before the kill.
                 Job::County(fips) => match self.work.registry.lock().unwrap().standing(fips, now()) {
@@ -527,7 +607,7 @@ impl Scheduler {
                     Standing::Unavailable(u) => Some(Resolution::Unavailable(u.reason)),
                     Standing::Open => None,
                 },
-                Job::State(_) => None,
+                Job::State(_) | Job::Jurisdictions(_) => None,
             });
             // An agent that saved one layer of a dataset taken per jurisdiction is asked once
             // about the jurisdictions it may have left out.
@@ -538,7 +618,7 @@ impl Scheduler {
                 let ask = self
                     .work
                     .with_agent(agent, |a| {
-                        let ask = a.saved == 1 && !a.followed_up;
+                        let ask = a.saved.len() == 1 && !a.followed_up;
                         a.followed_up = true;
                         ask
                     })
@@ -548,15 +628,14 @@ impl Scheduler {
                     continue;
                 }
             }
-            let last = last_text(&self.harness, agent);
             let outcome = match (resolution, record.state, job) {
-                (Some(Resolution::Covered(id)), _, _) => Outcome::Done { detail: id },
+                (Some(Resolution::Covered(id)), _, _) => Outcome::Done { detail: id, more: false },
                 (Some(Resolution::Unavailable(reason)), _, _) => Outcome::Unavailable { reason: reason.name().into() },
                 (None, AgentState::Failed, _) => Outcome::Failed { error: record.error.unwrap_or_default() },
                 (None, _, Job::State(_)) => {
-                    Outcome::Done { detail: last.unwrap_or_else(|| "no statewide layer".into()) }
+                    Outcome::Done { detail: last.unwrap_or_else(|| "no statewide layer".into()), more: false }
                 }
-                (None, _, Job::County(_)) => {
+                (None, _, Job::County(_) | Job::Jurisdictions(_)) => {
                     let budget = self.work.validate_budget;
                     let nudge = self
                         .work
@@ -591,6 +670,29 @@ impl Scheduler {
         }
     }
 
+    /// How a jurisdictions pass ended: what it saved and said, and whether another pass is due,
+    /// as after one that saved as many layers as a pass may or stopped part way. A pass whose
+    /// turn failed before it saved anything failed.
+    fn pass_outcome(&self, agent: &str, record: &erisharness::agent::AgentRecord, last: Option<String>) -> Outcome {
+        let (saved, left) = self.work.with_agent(agent, |a| (a.saved.clone(), a.left.clone())).unwrap_or_default();
+        let failed = record.state == AgentState::Failed;
+        if failed && saved.is_empty() {
+            return Outcome::Failed { error: record.error.clone().unwrap_or_default() };
+        }
+        let mut detail = String::new();
+        if !saved.is_empty() {
+            detail.push_str(&format!("Saved {}. ", saved.join(", ")));
+        }
+        if !left.is_empty() {
+            detail.push_str(&format!("Left to check: {}. ", left.join(", ")));
+        }
+        detail.push_str(&last.unwrap_or_default());
+        Outcome::Done {
+            detail: shorten(detail.trim(), 3000),
+            more: saved.len() >= LAYERS_PER_PASS || !left.is_empty() || failed,
+        }
+    }
+
     fn finish(&self, job: &Job, rung: usize, agent: &str, outcome: Outcome, mut tokens: Tokens) -> Result<()> {
         let tools = self.work.with_agent(agent, |a| a.tool_tokens.clone()).unwrap_or_default();
         for spent in tools.values() {
@@ -614,7 +716,9 @@ impl Scheduler {
             }
         }
         let line = match &outcome {
-            Outcome::Done { detail } => format!("done: {}", shorten(detail, 160)),
+            Outcome::Done { detail, more } => {
+                format!("done{}: {}", if *more { ", another pass due" } else { "" }, shorten(detail, 160))
+            }
             Outcome::Unavailable { reason } => format!("unavailable: {reason}"),
             Outcome::GaveUp { .. } => "gave up".into(),
             Outcome::Failed { error } => format!("failed: {}", shorten(error, 160)),
@@ -634,6 +738,7 @@ impl Scheduler {
                     history.rung = 0;
                 }
             }
+            history.note(&outcome);
             history.finished = Some(outcome);
         }
         self.work.agents.lock().unwrap().remove(agent);
@@ -663,6 +768,7 @@ impl Scheduler {
                 let report = validate::validate(&self.work.runtime, self.work.dataset, &spec, county).await;
                 if report.passed {
                     let _ = self.work.registry.lock().unwrap().verified(&spec.id, &fips, now());
+                    self.note_extent(&spec).await;
                 } else {
                     self.work.log(report.summary());
                     let _ = self.work.registry.lock().unwrap().unverified(&spec.id, &fips);

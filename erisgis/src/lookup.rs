@@ -57,6 +57,9 @@ pub struct SourceView {
     /// when the adapter does not say.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub official: Option<bool>,
+    /// Whether the layer's extent meets the box (or the layer does not say where it lies); one
+    /// lying elsewhere in the county is not read for it.
+    pub here: bool,
     /// Whether the box held more features than were read from it.
     pub more: bool,
     /// Why reading it failed.
@@ -144,6 +147,7 @@ pub async fn read(
                     publisher: spec.publisher.clone(),
                     verified,
                     official: spec.official,
+                    here: meets(spec, bbox),
                     more: false,
                     error: None,
                 })
@@ -181,6 +185,14 @@ pub async fn read(
     view
 }
 
+/// Whether the spec's layer may hold features in `bbox`: its extent, with a little room for its
+/// edges, meets the box, or it does not say where it lies.
+fn meets(spec: &Spec, bbox: Bbox) -> bool {
+    spec.extent.is_none_or(|e| {
+        Bbox([e.west() - 0.001, e.south() - 0.001, e.east() + 0.001, e.north() + 0.001]).intersects(&bbox)
+    })
+}
+
 async fn read_source(
     runtime: &Runtime,
     dataset: &Dataset,
@@ -190,6 +202,10 @@ async fn read_source(
 ) -> Result<Read, String> {
     if matches!(spec.source, Source::BulkDownload { .. }) {
         return Err("this source is a bulk download, which the map does not fetch".into());
+    }
+    // A layer lying elsewhere in the county holds nothing here.
+    if !meets(spec, bbox) {
+        return Ok(Read::default());
     }
     let kept = keep.map(|dir| dir.join(format!("{}-{}-{:016x}.json", dataset.name, spec.id, box_hash(bbox))));
     if let Some(path) = &kept

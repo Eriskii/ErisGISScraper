@@ -110,6 +110,9 @@ async fn arcgis(
     if q.get("returnCountOnly").is_some_and(|v| v == "true") {
         return axum::Json(json!({"count": grid.parcels.len()})).into_response();
     }
+    if q.get("returnExtentOnly").is_some_and(|v| v == "true") {
+        return axum::Json(extent(grid.parcels.iter().map(|p| p.bounds))).into_response();
+    }
     let all = grid.within(bbox_param(&q["geometry"]));
     let offset: usize =
         if variant == "ignores-offset" { 0 } else { q.get("resultOffset").map_or(0, |s| s.parse().unwrap()) };
@@ -262,6 +265,9 @@ impl Grid {
 
 /// The zoning layer: an ArcGIS FeatureServer answering GeoJSON, paged by 4.
 async fn zoning(State(grid): State<Arc<Grid>>, Query(q): Query<HashMap<String, String>>) -> Response {
+    if q.get("returnExtentOnly").is_some_and(|v| v == "true") {
+        return axum::Json(extent(grid.districts().into_iter())).into_response();
+    }
     let b = bbox_param(&q["geometry"]);
     let all: Vec<(usize, [f64; 4])> = grid
         .districts()
@@ -288,12 +294,31 @@ async fn zoning(State(grid): State<Arc<Grid>>, Query(q): Query<HashMap<String, S
     axum::Json(body).into_response()
 }
 
+async fn zoning_named(
+    Path(_layer): Path<String>,
+    state: State<Arc<Grid>>,
+    query: Query<HashMap<String, String>>,
+) -> Response {
+    zoning(state, query).await
+}
+
+/// An ArcGIS answer to a query for the extent of `boxes`, in longitude and latitude.
+fn extent(boxes: impl Iterator<Item = [f64; 4]>) -> Value {
+    let [mut w, mut s, mut e, mut n] = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+    for b in boxes {
+        (w, s, e, n) = (w.min(b[0]), s.min(b[1]), e.max(b[2]), n.max(b[3]));
+    }
+    json!({"extent": {"xmin": w, "ymin": s, "xmax": e, "ymax": n, "spatialReference": {"wkid": 4326}}})
+}
+
 /// Serves `grid`; returns the server's root URL.
 pub async fn serve(grid: Grid) -> String {
     let app = Router::new()
         .route("/arcgis/{variant}/FeatureServer/0/query", get(arcgis))
         .route("/arcgis/{variant}/FeatureServer/0", get(layer))
         .route("/zoning/FeatureServer/0/query", get(zoning))
+        // Other jurisdictions' layers over the same ground, each at a path of its own.
+        .route("/zoning/{layer}/FeatureServer/0/query", get(zoning_named))
         .route("/wfs", get(wfs))
         .route("/ogc/collections/parcels/items", get(ogc))
         .route("/page", get(page))

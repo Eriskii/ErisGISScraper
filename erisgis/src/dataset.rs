@@ -60,6 +60,9 @@ pub struct Instructions {
     /// In a dataset with an adapter per jurisdiction, what an agent that saved one layer and
     /// stopped is asked once, about the jurisdictions it may have missed.
     pub follow_up: &'static str,
+    /// In a dataset with an adapter per jurisdiction, the goal of a pass over a covered county
+    /// for the jurisdictions its saved layers leave out; `{most}` is how many one pass saves.
+    pub jurisdictions_goal: &'static str,
 }
 
 impl Dataset {

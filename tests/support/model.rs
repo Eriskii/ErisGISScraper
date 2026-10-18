@@ -20,6 +20,7 @@ pub enum Reply {
 pub type Brain = Arc<dyn Fn(&Request) -> Reply + Send + Sync>;
 
 /// What the brain sees of a request.
+#[derive(Clone)]
 pub struct Request {
     /// `codex` or `anthropic`, by the endpoint asked.
     pub provider: &'static str,
